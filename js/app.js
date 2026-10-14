@@ -1,4 +1,5 @@
-'use strict';
+import { createStore } from './store.js';
+import * as gh from './github.js';
 
 const KINDS = ['lecture', 'practice', 'lab'];
 const KIND_NAMES = { lecture: 'Лекция', practice: 'Практическое', lab: 'Лабораторная' };
@@ -19,9 +20,13 @@ const TABS = [
   ['settings', 'Настройки'],
 ];
 
-let ref = null; // справочники с сервера
+let ref = null; // справочники для отрисовки
+let db = null; // хранилище данных расписания (см. store.js)
+const conn = { gh: null, sha: null }; // подключение администратора к GitHub
 const state = {
   admin: false,
+  dirty: 0, // сколько изменений ещё не сохранено на GitHub
+  saving: false,
   tab: location.hash.slice(1) || store('tab') || 'day',
   date: nextStudyDay(todayISO()),
   day: null,
@@ -80,21 +85,12 @@ function plural(n, forms) {
 
 const fmtNum = n => (Number.isInteger(n) ? String(n) : n.toFixed(1).replace('.', ','));
 
+// Все действия идут в хранилище в памяти; на GitHub данные уходят по кнопке «Сохранить».
 async function api(method, path, body) {
-  const res = await fetch('/api' + path, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && state.admin && !path.startsWith('/login')) {
-    // Сессия истекла — возвращаемся в гостевой режим.
-    state.admin = false;
-    await reload();
-    render();
-  }
-  if (!res.ok) throw new Error(data.error || `Ошибка ${res.status}`);
-  return data;
+  const [p, qs] = path.split('?');
+  const result = db.handle(method, p, new URLSearchParams(qs ?? ''), body ?? {}, { admin: state.admin });
+  if (method !== 'GET') changed();
+  return structuredClone(result);
 }
 
 function toast(msg, kind = 'info') {
@@ -128,7 +124,7 @@ const fmtShort = s => s.split('-').reverse().slice(0, 2).join('.');
 // ---------- Справочники ----------
 
 async function reload() {
-  ref = await api('GET', state.admin ? '/bootstrap' : '/public/bootstrap');
+  ref = await api('GET', '/bootstrap');
   ref.byId = {};
   for (const k of ['rooms', 'teachers', 'groups', 'subjects', 'curriculum']) {
     ref.byId[k] = new Map(ref[k].map(x => [x.id, x]));
@@ -188,43 +184,165 @@ function availabilityText(t) {
 // ---------- Каркас ----------
 
 function renderTabs() {
-  mount($('#account'), state.admin
-    ? [el('span', { class: 'muted small' }, 'Администратор'), el('button', { class: 'btn', onclick: logout }, 'Выйти')]
-    : el('button', { class: 'btn', onclick: openLogin }, 'Войти'));
+  renderAccount();
   // Гости видят только расписание, без вкладок.
   if (!state.admin) return mount($('#tabs'));
   mount($('#tabs'), TABS.map(([id, label]) =>
     el('button', { class: state.tab === id ? 'active' : '', onclick: () => { state.tab = id; store('tab', id); history.replaceState(null, '', '#' + id); render(); } }, label)));
 }
 
+function renderAccount() {
+  if (!state.admin) return mount($('#account'), el('button', { class: 'btn', onclick: openLogin }, 'Войти'));
+  mount($('#account'),
+    el('span', { class: 'muted small' }, state.saving ? 'Сохраняю…' : state.dirty ? `Не сохранено изменений: ${state.dirty}` : 'Всё сохранено'),
+    el('button', { class: 'btn primary', disabled: !state.dirty || state.saving, onclick: saveToGitHub }, 'Сохранить'),
+    el('button', { class: 'btn', onclick: logout }, 'Выйти'));
+}
+
+// ---------- Вход и сохранение на GitHub ----------
+
+const TOKEN_KEY = 'rasp.token';
+const BACKUP_KEY = 'rasp.unsaved';
+function tokenGet() {
+  try { return localStorage.getItem(TOKEN_KEY) || sessionStorage.getItem(TOKEN_KEY); } catch { return null; }
+}
+function tokenSet(token, remember) {
+  try { (remember ? localStorage : sessionStorage).setItem(TOKEN_KEY, token); } catch { /* хранилище недоступно */ }
+}
+function tokenClear() {
+  try { localStorage.removeItem(TOKEN_KEY); sessionStorage.removeItem(TOKEN_KEY); } catch { /* хранилище недоступно */ }
+}
+
+// Каждое изменение сразу копируется в браузер, чтобы не потерять работу до сохранения.
+function changed() {
+  state.dirty++;
+  try { localStorage.setItem(BACKUP_KEY, JSON.stringify({ repo: conn.gh?.repo, sha: conn.sha, dirty: state.dirty, data: db.data })); } catch { /* слишком большой или запрещено */ }
+  renderAccount();
+}
+
+async function loadPublic() {
+  const res = await fetch('data.json?v=' + Date.now(), { cache: 'no-store' });
+  if (!res.ok) throw new Error('не найден файл data.json');
+  db = createStore(await res.json());
+}
+
+async function adminConnect(token, repo) {
+  const c = await gh.connect(token, repo);
+  const { data, sha } = await gh.loadData(c);
+  conn.gh = c;
+  conn.sha = sha;
+  db = createStore(data);
+  state.admin = true;
+  state.dirty = 0;
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(BACKUP_KEY)); } catch { /* нет копии */ }
+  if (saved?.repo === repo && saved.sha === sha && saved.dirty) {
+    db = createStore(saved.data);
+    state.dirty = saved.dirty;
+    toast('Восстановлены несохранённые изменения из этого браузера');
+  } else if (saved?.dirty) {
+    toast('Несохранённые изменения в браузере устарели (данные на GitHub уже другие) и были отброшены', 'error');
+    try { localStorage.removeItem(BACKUP_KEY); } catch { /* ignore */ }
+  }
+}
+
 function openLogin() {
-  let password = '';
+  const v = { token: '', repo: gh.detectRepo() || store('repo') || '', remember: true };
   const submit = close => quiet(async () => {
-    await api('POST', '/login', { password });
-    state.admin = true;
+    if (!v.token.trim()) throw new Error('Вставьте токен');
+    await adminConnect(v.token, v.repo.trim());
+    tokenSet(v.token.trim(), v.remember);
+    store('repo', v.repo.trim());
     state.tab = store('tab') || 'day';
     await reload();
     close();
     render();
   });
   const closeLogin = modal('Вход для администратора', [
-    el('form', { onsubmit: e => { e.preventDefault(); submit(closeLogin); } },
-      field('Пароль', el('input', { type: 'password', autocomplete: 'current-password', oninput: e => { password = e.target.value; } }))),
+    el('p', { style: 'margin:0' }, 'Вход — это личный токен GitHub с правом изменять этот репозиторий. Его можно создать один раз и пользоваться дальше.'),
+    el('ol', { class: 'small', style: 'margin:0;padding-left:18px;display:grid;gap:4px' },
+      el('li', {}, 'Откройте ', el('a', { href: 'https://github.com/settings/personal-access-tokens/new', target: '_blank', rel: 'noopener' }, 'создание токена на GitHub'), '.'),
+      el('li', {}, 'Repository access → Only select repositories → выберите этот репозиторий.'),
+      el('li', {}, 'Permissions → Repository permissions → Contents: Read and write.'),
+      el('li', {}, 'Нажмите Generate token и вставьте его ниже.')),
+    el('form', { style: 'display:grid;gap:12px', onsubmit: e => { e.preventDefault(); submit(closeLogin); } },
+      gh.detectRepo() ? null : field('Репозиторий', el('input', { value: v.repo, placeholder: 'владелец/raspisanie', oninput: e => { v.repo = e.target.value; } })),
+      field('Токен', el('input', { type: 'password', autocomplete: 'off', placeholder: 'github_pat_…', oninput: e => { v.token = e.target.value; } })),
+      el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: true, onchange: e => { v.remember = e.target.checked; } }), 'Запомнить на этом устройстве'),
+      el('button', { type: 'submit', hidden: true })),
   ], close => [
     el('button', { class: 'btn', onclick: close }, 'Отмена'),
     el('button', { class: 'btn primary', onclick: () => submit(close) }, 'Войти'),
   ]);
 }
 
+async function saveToGitHub() {
+  if (!state.dirty || state.saving) return;
+  state.saving = true;
+  renderAccount();
+  try {
+    const n = state.dirty;
+    conn.sha = await gh.saveData(conn.gh, db.data, conn.sha, `Расписание: ${n} ${plural(n, ['изменение', 'изменения', 'изменений'])}`);
+    state.dirty = 0;
+    try { localStorage.removeItem(BACKUP_KEY); } catch { /* ignore */ }
+    toast('Сохранено. На сайте у всех обновится примерно через минуту');
+  } catch (e) {
+    if (e instanceof gh.ConflictError) resolveConflict();
+    else toast(e.message, 'error');
+  } finally {
+    state.saving = false;
+    renderAccount();
+  }
+}
+
+// Кто-то сохранил раньше нас: можно взять их версию или записать свою поверх.
+function resolveConflict() {
+  modal('Данные на GitHub уже изменились', [
+    el('p', { style: 'margin:0' }, 'Пока вы работали, расписание сохранил кто-то другой (или вы в другой вкладке).'),
+    el('p', { style: 'margin:0' }, 'Можно загрузить их версию — ваши несохранённые изменения пропадут. Или записать свою версию поверх — тогда пропадут их изменения.'),
+  ], close => [
+    el('button', { class: 'btn', onclick: close }, 'Отмена'),
+    el('button', {
+      class: 'btn',
+      onclick: () => quiet(async () => {
+        const { data, sha } = await gh.loadData(conn.gh);
+        db = createStore(data);
+        conn.sha = sha;
+        state.dirty = 0;
+        try { localStorage.removeItem(BACKUP_KEY); } catch { /* ignore */ }
+        await reload();
+        close();
+        render();
+      }),
+    }, 'Загрузить их версию'),
+    el('button', {
+      class: 'btn danger',
+      onclick: () => quiet(async () => {
+        conn.sha = (await gh.loadData(conn.gh)).sha;
+        close();
+        await saveToGitHub();
+      }),
+    }, 'Записать мою поверх'),
+  ]);
+}
+
 async function logout() {
+  if (state.dirty && !confirm('Есть несохранённые изменения. Выйти без сохранения? (Копия останется в этом браузере.)')) return;
+  tokenClear();
+  state.admin = false;
+  state.dirty = 0;
+  conn.gh = null;
+  history.replaceState(null, '', location.pathname);
   await quiet(async () => {
-    await api('POST', '/logout', {});
-    state.admin = false;
-    history.replaceState(null, '', location.pathname);
+    await loadPublic();
     await reload();
     render();
   });
 }
+
+window.addEventListener('beforeunload', e => {
+  if (state.dirty) e.preventDefault();
+});
 
 const VIEWS = {
   day: renderDay, view: renderView, plan: renderPlan, teachers: renderTeachers,
@@ -842,7 +960,7 @@ async function renderTeachers(main) {
         el('td', {}, t.short_name),
         el('td', {}, room(t.room_id)?.name ?? '—'),
         el('td', {}, availabilityText(t)),
-        el('td', { class: 'small' }, t.absences.filter(a => a.date_to >= todayISO()).map(a => el('div', {}, `${fmtShort(a.date_from)}–${fmtShort(a.date_to)} ${a.reason}`))),
+        el('td', { class: 'small' }, t.absences.filter(a => a.date_to >= todayISO()).map(a => el('div', {}, `${fmtShort(a.date_from)}–${fmtShort(a.date_to)}`))),
         el('td', { class: 'row-actions' },
           el('button', { class: 'btn small', onclick: () => editTeacher(t) }, 'Изменить'), ' ',
           el('button', { class: 'btn small danger', onclick: () => removeRow('teachers', t.id, `Удалить преподавателя ${t.short_name}? В его парах преподаватель станет не указан.`) }, 'Удалить'))))))),
@@ -881,15 +999,14 @@ function editTeacher(t) {
   const drawAbsences = () => {
     if (!t) { mount(absBox, el('p', { class: 'hint', style: 'margin:0' }, 'Отсутствия можно добавить после сохранения.')); return; }
     const cur = teacher(t.id);
-    const nf = { date_from: todayISO(), date_to: todayISO(), reason: 'Больничный' };
+    const nf = { date_from: todayISO(), date_to: todayISO() };
     mount(absBox,
       ...cur.absences.map(a => el('div', { class: 'toolbar', style: 'margin:0 0 4px' },
-        `${fmtDate(a.date_from)} – ${fmtDate(a.date_to)}: ${a.reason}`,
+        `${fmtDate(a.date_from)} – ${fmtDate(a.date_to)}`,
         el('button', { class: 'btn small danger', onclick: () => quiet(async () => { await api('DELETE', `/absences/${a.id}`); await reload(); drawAbsences(); }) }, 'Удалить'))),
       el('div', { class: 'toolbar', style: 'margin:0' },
         el('input', { type: 'date', value: nf.date_from, onchange: e => { nf.date_from = e.target.value; } }), '–',
         el('input', { type: 'date', value: nf.date_to, onchange: e => { nf.date_to = e.target.value; } }),
-        select([['Больничный', 'Больничный'], ['Командировка', 'Командировка'], ['Отпуск', 'Отпуск'], ['Другое', 'Другое']], nf.reason, x => { nf.reason = x; }),
         el('button', {
           class: 'btn small',
           onclick: () => quiet(async () => {
@@ -1118,7 +1235,7 @@ async function renderSettings(main) {
           render();
         }),
       }, 'Сохранить настройки'))),
-    passwordCard(),
+    storageCard(),
     el('h3', { style: 'margin-top:28px' }, 'Журнал изменений'),
     el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
       el('thead', {}, el('tr', {}, el('th', {}, 'Когда'), el('th', {}, 'День расписания'), el('th', {}, 'Действие'), el('th', {}, 'Подробности'))),
@@ -1130,34 +1247,35 @@ async function renderSettings(main) {
   );
 }
 
-function passwordCard() {
-  const v = { current: '', next: '', repeat: '' };
-  const input = (key, autocomplete) => el('input', { type: 'password', autocomplete, oninput: e => { v[key] = e.target.value; } });
-  return el('div', { class: 'card', style: 'max-width:640px;display:grid;gap:14px;margin-top:20px' },
-    el('h3', { style: 'margin:0' }, 'Пароль администратора'),
-    el('div', { class: 'row' },
-      field('Текущий пароль', input('current', 'current-password')),
-      field('Новый пароль', input('next', 'new-password'), 'Не короче 8 символов'),
-      field('Повторите новый', input('repeat', 'new-password'))),
-    el('div', {}, el('button', {
-      class: 'btn',
-      onclick: () => quiet(async () => {
-        if (v.next !== v.repeat) throw new Error('Новые пароли не совпадают');
-        await api('PUT', '/password', { current: v.current, next: v.next });
-        toast('Пароль изменён. Другие вошедшие устройства вышли из системы');
-        render();
-      }),
-    }, 'Сменить пароль')));
+function storageCard() {
+  const repo = conn.gh?.repo;
+  return el('div', { class: 'card', style: 'max-width:640px;display:grid;gap:10px;margin-top:20px' },
+    el('h3', { style: 'margin:0' }, 'Где хранятся данные'),
+    el('p', { style: 'margin:0' }, 'Всё расписание — в файле data.json репозитория ',
+      el('a', { href: `https://github.com/${repo}`, target: '_blank', rel: 'noopener' }, repo), '. Каждое «Сохранить» — отдельная правка в его истории, любую можно откатить.'),
+    el('p', { class: 'hint', style: 'margin:0' }, 'Репозиторий публичный: этот файл может открыть любой. Не храните в справочниках личные данные сверх ФИО.'),
+    el('p', { class: 'hint', style: 'margin:0' }, 'Чтобы добавить ещё одного администратора: Settings → Collaborators репозитория → пригласить его, затем он создаёт свой токен.'));
 }
 
 // ---------- Запуск ----------
 
 (async () => {
+  const token = tokenGet();
+  const repo = gh.detectRepo() || store('repo');
   try {
-    state.admin = (await api('GET', '/me')).admin;
+    if (token && repo) {
+      try {
+        await adminConnect(token, repo);
+      } catch (e) {
+        toast('Не удалось войти: ' + e.message, 'error');
+        if (!/сети|fetch/i.test(e.message)) tokenClear();
+        state.admin = false;
+      }
+    }
+    if (!state.admin) await loadPublic();
     await reload();
   } catch (e) {
-    $('#main').replaceChildren(el('div', { class: 'card' }, 'Сервер недоступен: ' + e.message));
+    mount($('#main'), el('div', { class: 'card' }, 'Не удалось загрузить расписание: ' + e.message));
     return;
   }
   render();

@@ -1,4 +1,5 @@
 // Правила расписания (раздел 3 ТЗ) и учёт выполнения плана (раздел 8 ТЗ).
+// Модуль без зависимостей: работает и в браузере, и в тестах Node.
 
 export const KINDS = ['lecture', 'practice', 'lab'];
 export const KIND_NAMES = { lecture: 'Лекция', practice: 'Практическое', lab: 'Лабораторная' };
@@ -17,11 +18,7 @@ export const DEFAULT_SETTINGS = {
   ],
 };
 
-export function loadSettings(db) {
-  // Отдаём только известные настройки: в той же таблице лежит служебное (хэш пароля и т.п.).
-  const rows = db.prepare('SELECT key, value FROM settings').all().filter(r => r.key in DEFAULT_SETTINGS);
-  return { ...DEFAULT_SETTINGS, ...Object.fromEntries(rows.map(r => [r.key, JSON.parse(r.value)])) };
-}
+export const settingsOf = data => ({ ...DEFAULT_SETTINGS, ...data.settings });
 
 // 1 = понедельник … 7 = воскресенье
 export function weekdayOf(date) {
@@ -39,14 +36,14 @@ export const unitKey = (curriculumId, kind, subgroupId) => `${curriculumId}|${ki
 
 // Сколько пар проведено по каждой единице плана (предмет × вид × подгруппа).
 // Учитываются утверждённые дни; extraDate добавляет черновик этого дня.
-export function computeProgress(db, extraDate = null) {
-  const rows = db.prepare(`
-    SELECT l.curriculum_id AS cid, l.kind, COALESCE(l.subgroup_id, 0) AS sid, COUNT(*) AS n
-    FROM lessons l LEFT JOIN schedule_days d ON d.date = l.date
-    WHERE l.status = 'active' AND (d.status = 'approved' OR l.date = ?)
-    GROUP BY l.curriculum_id, l.kind, COALESCE(l.subgroup_id, 0)`).all(extraDate ?? '');
+export function computeProgress(data, extraDate = null) {
   const out = {};
-  for (const r of rows) out[unitKey(r.cid, r.kind, r.sid)] = r.n;
+  for (const l of data.lessons) {
+    if (l.status !== 'active') continue;
+    if (data.days[l.date]?.status !== 'approved' && l.date !== extraDate) continue;
+    const k = unitKey(l.curriculum_id, l.kind, l.subgroup_id);
+    out[k] = (out[k] ?? 0) + 1;
+  }
   return out;
 }
 
@@ -61,40 +58,34 @@ function groupBy(list, keyFn) {
   return m;
 }
 
-const ids = ls => ls.map(l => l.id);
+const byId = list => new Map(list.map(x => [x.id, x]));
 
-export function validateDay(db, date) {
-  const s = loadSettings(db);
+export function validateDay(data, date) {
+  const s = settingsOf(data);
   const issues = [];
-  const add = (level, text, lessons = [], groupId = null) => issues.push({ level, text, lessonIds: ids(lessons), groupId });
+  const add = (level, text, lessons = [], groupId = null) =>
+    issues.push({ level, text, lessonIds: lessons.map(l => l.id), groupId });
 
-  const lessons = db.prepare("SELECT * FROM lessons WHERE date = ? AND status = 'active'").all(date);
+  const lessons = data.lessons.filter(l => l.date === date && l.status === 'active');
   if (!lessons.length) return issues;
 
-  const byId = sql => new Map(db.prepare(sql).all().map(r => [r.id, r]));
-  const teachers = byId('SELECT * FROM teachers');
-  const rooms = byId('SELECT * FROM rooms');
-  const groups = byId('SELECT * FROM study_groups');
-  const subgroups = byId('SELECT * FROM subgroups');
-  const curriculum = byId('SELECT * FROM curriculum');
-  const subjects = byId('SELECT * FROM subjects');
-  for (const g of groups.values()) g.subgroups = [];
-  for (const sg of subgroups.values()) groups.get(sg.group_id)?.subgroups.push(sg);
+  const teachers = byId(data.teachers);
+  const rooms = byId(data.rooms);
+  const groups = byId(data.groups);
+  const subgroups = new Map(data.groups.flatMap(g => g.subgroups.map(sg => [sg.id, sg])));
+  const curriculum = byId(data.curriculum);
+  const subjects = byId(data.subjects);
 
   const wd = weekdayOf(date);
-  const avail = new Map(db.prepare('SELECT * FROM availability WHERE weekday = ?').all(wd).map(a => [a.teacher_id, a]));
-  const absent = new Set(db.prepare('SELECT teacher_id FROM absences WHERE date_from <= ? AND date_to >= ?')
-    .all(date, date).map(r => r.teacher_id));
   const roomOwners = new Map();
-  for (const t of teachers.values()) {
+  for (const t of data.teachers) {
     if (t.room_id) roomOwners.set(t.room_id, [...(roomOwners.get(t.room_id) ?? []), t.id]);
   }
 
   const tName = id => teachers.get(id)?.short_name ?? '—';
   const who = l => {
-    const g = groups.get(l.group_id);
     const sg = l.subgroup_id ? subgroups.get(l.subgroup_id) : null;
-    return (g?.name ?? '?') + (sg ? ` (${sg.name})` : '');
+    return (groups.get(l.group_id)?.name ?? '?') + (sg ? ` (${sg.name})` : '');
   };
   const subjName = l => subjects.get(curriculum.get(l.curriculum_id)?.subject_id)?.name ?? '?';
 
@@ -114,12 +105,14 @@ export function validateDay(db, date) {
     if (!t) {
       add('error', `${where}: не указан преподаватель`, [l]);
     } else {
-      const a = avail.get(t.id);
+      const a = t.availability.find(x => x.weekday === wd);
       if (!a) add('error', `${where}: ${t.short_name} не работает в этот день недели`, [l]);
       else if (l.pair < a.pair_from || l.pair > a.pair_to) {
         add('error', `${where}: ${t.short_name} доступен только с ${a.pair_from} по ${a.pair_to} пару`, [l]);
       }
-      if (absent.has(t.id)) add('error', `${where}: ${t.short_name} отсутствует в этот день`, [l]);
+      if (t.absences.some(x => x.date_from <= date && x.date_to >= date)) {
+        add('error', `${where}: ${t.short_name} отсутствует в этот день`, [l]);
+      }
       if (t.room_id && l.room_id !== t.room_id) {
         add('error', `${where}: ${t.short_name} ведёт занятия только в закреплённой аудитории ${rooms.get(t.room_id)?.name}`, [l]);
       }
@@ -160,7 +153,7 @@ export function validateDay(db, date) {
   }
 
   // Группа и подгруппы: накладки, лимит пар, окна
-  for (const g of groups.values()) {
+  for (const g of data.groups) {
     const gl = lessons.filter(l => l.group_id === g.id);
     if (!gl.length) continue;
 
@@ -194,7 +187,7 @@ export function validateDay(db, date) {
   }
 
   // Превышение часов учебного плана (с учётом этого дня)
-  const progress = computeProgress(db, date);
+  const progress = computeProgress(data, date);
   for (const [key, ls] of groupBy(lessons, l => unitKey(l.curriculum_id, l.kind, l.subgroup_id))) {
     const item = curriculum.get(ls[0].curriculum_id);
     if (!item) continue;

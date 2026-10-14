@@ -1,14 +1,13 @@
 {
   "name": "raspisanie",
   "version": "0.1.0",
-  "description": "Веб-приложение для составления расписания техникума",
+  "description": "Сайт для составления расписания техникума (GitHub Pages)",
   "type": "module",
   "private": true,
   "engines": {
-    "node": ">=22.13"
+    "node": ">=18"
   },
   "scripts": {
-    "start": "node server.js",
     "test": "node --test"
   }
 }
