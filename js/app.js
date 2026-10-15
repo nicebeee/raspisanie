@@ -247,6 +247,11 @@ async function adminConnect(token, repo) {
     toast('Несохранённые изменения в браузере устарели (данные на GitHub уже другие) и были отброшены', 'error');
     try { localStorage.removeItem(BACKUP_KEY); } catch { /* ignore */ }
   }
+  const pruned = db.pruneUnusedSubjects();
+  if (pruned) {
+    changed();
+    toast(`Удалены предметы без групп (${pruned}) — остались от удалённых раньше групп. Нажмите «Сохранить»`);
+  }
 }
 
 function openLogin() {

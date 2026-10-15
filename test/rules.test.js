@@ -154,3 +154,12 @@ test('предмет группы: добавление с часами, пов�
   call('DELETE', `/curriculum/${item.id}`);
   assert.ok(!data.subjects.some(s => s.name === 'Черчение'));
 });
+
+test('предметы без групп (остатки старых удалений) убираются', () => {
+  const data = structuredClone(demo);
+  data.subjects.push({ id: 9001, name: 'Сирота', room_type: '' });
+  const st = createStore(data);
+  assert.equal(st.pruneUnusedSubjects(), 1);
+  assert.ok(!data.subjects.some(s => s.name === 'Сирота'));
+  assert.equal(st.pruneUnusedSubjects(), 0);
+});

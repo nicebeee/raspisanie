@@ -507,6 +507,12 @@ export function createStore(data) {
 
   return {
     data,
+    // Убирает предметы, которых нет ни в одном учебном плане (остались от старых удалений). Возвращает, сколько убрано.
+    pruneUnusedSubjects() {
+      const before = data.subjects.length;
+      dropUnusedSubjects(data.subjects.map(s => s.id));
+      return before - data.subjects.length;
+    },
     handle(method, path, query, body, ctx = { admin: false }) {
       for (const r of routes) {
         if (r.method !== method) continue;
