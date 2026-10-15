@@ -226,6 +226,55 @@ export function createStore(data) {
     return { copied: items.length };
   });
 
+  // Загрузка учебного плана из Excel (разбор — в plan-import.js).
+  // Предметы ищутся по названию и создаются, если их нет; у уже существующих строк плана
+  // обновляются только часы и семестр — преподаватель и деление на подгруппы сохраняются.
+  on('POST', '/curriculum/import', (_, body) => {
+    let group;
+    if (body.new_group) {
+      const g = clean(TABLES.groups, body.new_group);
+      checkUnique('groups', TABLES.groups, g, null);
+      group = { id: nextId(), ...g, subgroups: [] };
+      data.groups.push(group);
+    } else {
+      group = find(data.groups, body.group_id);
+      if (!group) throw bad('Выберите группу');
+    }
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) throw bad('Не выбрано ни одного предмета');
+
+    const hours = v => {
+      const n = Number(v ?? 0);
+      if (!Number.isInteger(n) || n < 0) throw bad('Часы должны быть целым неотрицательным числом');
+      return n;
+    };
+    let created = 0, updated = 0, subjectsCreated = 0;
+    for (const it of items) {
+      const name = String(it.name ?? '').replace(/\s+/g, ' ').trim();
+      if (!name) throw bad('У предмета нет названия');
+      let subj = data.subjects.find(s => s.name.toLowerCase() === name.toLowerCase());
+      if (!subj) {
+        subj = { id: nextId(), name, room_type: '' };
+        data.subjects.push(subj);
+        subjectsCreated++;
+      }
+      const row = {
+        h_lecture: hours(it.lecture), h_practice: hours(it.practice), h_lab: hours(it.lab),
+        semester: it.semester === 1 || it.semester === 2 ? it.semester : null,
+      };
+      const existing = data.curriculum.find(c => c.group_id === group.id && c.subject_id === subj.id);
+      if (existing) {
+        Object.assign(existing, row);
+        updated++;
+      } else {
+        data.curriculum.push({ id: nextId(), group_id: group.id, subject_id: subj.id, teacher_id: null, split_practice: 0, split_lab: 0, ...row });
+        created++;
+      }
+    }
+    log(null, 'Загрузка плана', `${group.name}: добавлено предметов ${created}, обновлено ${updated}` + (body.source ? ` (файл ${body.source})` : ''));
+    return { group_id: group.id, created, updated, subjects_created: subjectsCreated };
+  });
+
   on('PUT', '/settings', (_, body) => {
     const s = settingsOf(data);
     const maxPairs = Number(body.max_pairs ?? s.max_pairs);

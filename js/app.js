@@ -1,5 +1,6 @@
 import { createStore } from './store.js';
 import * as gh from './github.js';
+import { parsePlanWorkbook, guessCourse, planForCourse } from './plan-import.js';
 
 const KINDS = ['lecture', 'practice', 'lab'];
 const KIND_NAMES = { lecture: 'Лекция', practice: 'Практическое', lab: 'Лабораторная' };
@@ -814,11 +815,13 @@ async function renderPlan(main) {
   if (!group(state.planGroup)) state.planGroup = ref.groups[0]?.id ?? null;
   const g = group(state.planGroup);
   if (!g) {
-    mount(main, el('div', { class: 'card' }, 'Сначала добавьте группу во вкладке «Группы и предметы».'));
+    mount(main, el('div', { class: 'card', style: 'display:grid;gap:12px;justify-items:start' },
+      'Групп пока нет. Добавьте группу во вкладке «Группы и предметы» или загрузите учебный план из Excel — группа создастся сама.',
+      el('button', { class: 'btn primary', onclick: () => importPlan(null) }, 'Загрузить из Excel…')));
     return;
   }
   const items = ref.curriculum
-    .filter(c => c.group_id === g.id && (!state.planSemester || c.semester === state.planSemester))
+    .filter(c => c.group_id === g.id && (!state.planSemester || !c.semester || c.semester === state.planSemester))
     .sort((a, b) => subjName(a).localeCompare(subjName(b), 'ru'));
   const hpp = ref.settings.hours_per_pair;
 
@@ -836,7 +839,7 @@ async function renderPlan(main) {
         el('div', { class: 'muted small' }, st.parts.join(' · ')),
         splitNote.length ? el('div', { class: 'muted small' }, 'По подгруппам: ' + splitNote.join(', ')) : null),
       el('td', {}, teacher(c.teacher_id)?.short_name ?? '—'),
-      el('td', { class: 'num' }, c.semester ?? '—'),
+      el('td', { class: 'num' }, c.semester ?? '1–2'),
       el('td', { class: 'num' }, hours),
       KINDS.map(k => el('td', { class: 'num' }, c['h_' + k] || '—')),
       el('td', { class: 'num' }, fmtNum(st.done)),
@@ -853,9 +856,10 @@ async function renderPlan(main) {
       select([[0, 'Весь год'], [1, '1 семестр'], [2, '2 семестр']], state.planSemester, v => { state.planSemester = Number(v); render(); }),
       el('div', { class: 'spacer' }),
       el('button', { class: 'btn', onclick: () => copyPlan(g) }, 'Скопировать план в группу…'),
+      el('button', { class: 'btn', onclick: () => importPlan(g) }, 'Загрузить из Excel…'),
       el('button', { class: 'btn primary', onclick: () => editPlanItem(g, null) }, 'Добавить предмет')),
     el('p', { class: 'muted' },
-      `${g.specialty || 'Специальность не указана'} · ${g.course ? g.course + ' курс' : ''} · ${g.size ?? '?'} чел.` +
+      [g.specialty || 'Специальность не указана', g.course ? g.course + ' курс' : '', g.size ? g.size + ' чел.' : ''].filter(Boolean).join(' · ') +
       (g.subgroups.length ? ` · подгруппы: ${g.subgroups.map(s => s.name).join(', ')}` : '') +
       ` · 1 пара = ${hpp} ч. Учитываются только утверждённые дни.`),
     el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
@@ -863,7 +867,7 @@ async function renderPlan(main) {
         el('th', {}, 'Предмет'), el('th', {}, 'Преподаватель'), el('th', { class: 'num' }, 'Сем.'),
         el('th', { class: 'num' }, 'Всего, ч'), KINDS.map(k => el('th', { class: 'num' }, KIND_COL[k])),
         el('th', { class: 'num' }, 'Проведено, пар'), el('th', { class: 'num' }, 'Осталось, пар'), el('th', {}))),
-      el('tbody', {}, rows.length ? rows : el('tr', {}, el('td', { colspan: 10, class: 'muted' }, 'В плане пока нет предметов.'))),
+      el('tbody', {}, rows.length ? rows : el('tr', {}, el('td', { colspan: 10, class: 'muted' }, 'В плане пока нет предметов. Их можно загрузить из Excel — кнопка «Загрузить из Excel…» выше.'))),
       rows.length ? el('tfoot', {}, el('tr', {},
         el('td', {}, 'Итого'), el('td', {}), el('td', {}),
         el('td', { class: 'num' }, totals.all), KINDS.map(k => el('td', { class: 'num' }, totals[k])),
@@ -890,7 +894,7 @@ function editPlanItem(g, c) {
       'Список предметов — во вкладке «Группы и предметы».'),
     el('div', { class: 'row' },
       field('Преподаватель', select([['', '— не назначен —'], ...ref.teachers.map(t => [t.id, t.short_name])], v.teacher_id, x => { v.teacher_id = x; })),
-      field('Семестр', select([[1, '1 семестр'], [2, '2 семестр']], v.semester ?? 1, x => { v.semester = Number(x); }))),
+      field('Семестр', select([['', 'Весь год'], [1, '1 семестр'], [2, '2 семестр']], v.semester ?? '', x => { v.semester = x ? Number(x) : null; }))),
     el('div', { class: 'row' },
       field(KIND_COL.lecture, num('h_lecture')),
       field(KIND_COL.practice, num('h_practice')),
@@ -915,6 +919,121 @@ function editPlanItem(g, c) {
       }),
     }, 'Сохранить'),
   ]);
+}
+
+// ---------- Загрузка учебного плана из Excel ----------
+
+function importPlan(currentGroup) {
+  const input = el('input', { type: 'file', accept: '.xls,.xlsx', style: 'display:none' });
+  input.addEventListener('change', async () => {
+    const file = input.files[0];
+    input.remove();
+    if (!file) return;
+    let plan;
+    try {
+      const XLSX = await import('./vendor/xlsx.mjs');
+      plan = parsePlanWorkbook(XLSX, XLSX.read(await file.arrayBuffer(), { type: 'array' }));
+    } catch (e) {
+      toast('Не удалось прочитать файл: ' + e.message, 'error');
+      return;
+    }
+    if (!plan.disciplines.length) return toast('В файле не нашлось ни одной дисциплины', 'error');
+    openImportPreview(plan, file.name, currentGroup);
+  });
+  document.body.append(input);
+  input.click();
+}
+
+function openImportPreview(plan, fileName, currentGroup) {
+  const courses = Math.max(1, Math.ceil(plan.semesterCount / 2));
+  const guessed = guessCourse(plan);
+  const v = {
+    group: currentGroup?.id ?? 'new',
+    course: guessed ?? (currentGroup?.course >= 1 && currentGroup.course <= courses ? currentGroup.course : 1),
+    newGroup: { name: fileName.replace(/\.[^.]+$/, ''), specialty: plan.specialty, size: '' },
+    off: new Set(), // индексы, с которых сняли галочку
+  };
+  const body = el('div', { style: 'display:grid;gap:14px' });
+
+  function draw() {
+    const items = planForCourse(plan, v.course);
+    const groupId = v.group === 'new' ? null : Number(v.group);
+    const statusOf = it => {
+      const subj = ref.subjects.find(s => s.name.toLowerCase() === it.name.toLowerCase());
+      const cur = subj && groupId ? ref.curriculum.find(c => c.group_id === groupId && c.subject_id === subj.id) : null;
+      if (cur) return `обновит часы (было ${cur.h_lecture + cur.h_practice + cur.h_lab} ч)`;
+      return subj ? 'добавит в план' : 'новый предмет';
+    };
+    const chosen = items.filter(it => !v.off.has(it.index));
+    const sum = k => chosen.reduce((s, it) => s + it[k], 0);
+    const semLabel = it => (it.semester ? `${it.semester}` : '1–2');
+
+    mount(body,
+      el('div', { class: 'notice' },
+        el('div', { style: 'font-weight:600' }, plan.specialty || 'Специальность не указана'),
+        el('div', { class: 'small' }, `Файл ${fileName} · ${plan.startYear ? 'год начала ' + plan.startYear : 'год начала не указан'} · семестров: ${plan.semesterCount}`)),
+      el('div', { class: 'row' },
+        field('В группу', select([...ref.groups.map(g => [g.id, g.name]), ['new', '+ Новая группа']], v.group, x => { v.group = x; draw(); })),
+        field('Курс', select(Array.from({ length: courses }, (_, i) => [i + 1, `${i + 1} курс (семестры ${i * 2 + 1} и ${i * 2 + 2})`]), v.course, x => { v.course = Number(x); v.off.clear(); draw(); }),
+          guessed ? `По году начала ${plan.startYear} сейчас ${guessed} курс` : 'В файле не указан год начала — выберите курс сами')),
+      v.group === 'new' ? el('div', { class: 'row' },
+        field('Название группы', el('input', { value: v.newGroup.name, oninput: e => { v.newGroup.name = e.target.value; } })),
+        field('Студентов', el('input', { type: 'number', min: 0, value: v.newGroup.size, oninput: e => { v.newGroup.size = e.target.value; } }))) : null,
+      items.length
+        ? el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
+          el('thead', {}, el('tr', {},
+            el('th', {}, el('input', {
+              type: 'checkbox', checked: v.off.size === 0, 'aria-label': 'Выбрать все',
+              onchange: e => { if (e.target.checked) v.off.clear(); else items.forEach(it => v.off.add(it.index)); draw(); },
+            })),
+            el('th', {}, 'Индекс'), el('th', {}, 'Предмет'), el('th', { class: 'num' }, 'Лекции, ч'), el('th', { class: 'num' }, 'Практ., ч'),
+            el('th', { class: 'num' }, 'Лаб., ч'), el('th', { class: 'num' }, 'Всего, ч'), el('th', { class: 'num' }, 'Сем.'), el('th', {}, 'Что будет'))),
+          el('tbody', {}, items.map(it => el('tr', { style: v.off.has(it.index) ? 'opacity:.45' : '' },
+            el('td', {}, el('input', {
+              type: 'checkbox', checked: !v.off.has(it.index),
+              onchange: e => { if (e.target.checked) v.off.delete(it.index); else v.off.add(it.index); draw(); },
+            })),
+            el('td', { class: 'small muted' }, it.index),
+            el('td', {}, it.name),
+            el('td', { class: 'num' }, it.lecture || '—'),
+            el('td', { class: 'num' }, it.practice || '—'),
+            el('td', { class: 'num' }, it.lab || '—'),
+            el('td', { class: 'num' }, it.lecture + it.practice + it.lab),
+            el('td', { class: 'num' }, semLabel(it)),
+            el('td', { class: 'small' }, statusOf(it))))),
+          el('tfoot', {}, el('tr', {}, el('td', {}), el('td', {}), el('td', {}, `Выбрано: ${chosen.length}`),
+            el('td', { class: 'num' }, sum('lecture')), el('td', { class: 'num' }, sum('practice')), el('td', { class: 'num' }, sum('lab')),
+            el('td', { class: 'num' }, sum('lecture') + sum('practice') + sum('lab')), el('td', {}), el('td', {})))))
+        : el('p', { class: 'muted', style: 'margin:0' }, `На ${v.course} курсе в этом плане нет дисциплин с часами.`),
+      el('p', { class: 'hint', style: 'margin:0' },
+        'Часы двух семестров курса складываются в год. Семинары и курсовое проектирование учтены как практические. ' +
+        'Практики (УП, ПП), экзамены и итоговые строки не загружаются. У уже существующих предметов обновятся только часы — преподаватель и деление на подгруппы останутся. ' +
+        'Преподавателей назначьте после загрузки.'));
+    const btn = $('#import-submit');
+    if (btn) { btn.textContent = `Загрузить (${chosen.length})`; btn.disabled = !chosen.length; }
+  }
+
+  modal('Учебный план из Excel', body, close => [
+    el('button', { class: 'btn', onclick: close }, 'Отмена'),
+    el('button', {
+      class: 'btn primary', id: 'import-submit',
+      onclick: () => quiet(async () => {
+        const items = planForCourse(plan, v.course).filter(it => !v.off.has(it.index))
+          .map(({ name, lecture, practice, lab, semester }) => ({ name, lecture, practice, lab, semester }));
+        const target = v.group === 'new'
+          ? { new_group: { name: v.newGroup.name, specialty: v.newGroup.specialty, course: v.course, size: v.newGroup.size } }
+          : { group_id: Number(v.group) };
+        const r = await api('POST', '/curriculum/import', { ...target, items, source: fileName });
+        await reload();
+        state.planGroup = r.group_id;
+        store('planGroup', r.group_id);
+        close();
+        render();
+        toast(`Загружено: новых предметов в плане ${r.created}, обновлено ${r.updated}. Не забудьте нажать «Сохранить» и назначить преподавателей`);
+      }),
+    }, 'Загрузить'),
+  ], { wide: true });
+  draw();
 }
 
 function copyPlan(g) {
