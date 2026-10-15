@@ -75,7 +75,7 @@ test('курс по году начала; без года — не угадыв
 });
 
 test('загрузка в группу: новые предметы создаются, существующие обновляют часы, преподаватель сохраняется', () => {
-  const data = structuredClone(JSON.parse(fs.readFileSync(new URL('../data.json', import.meta.url), 'utf8')));
+  const data = structuredClone(JSON.parse(fs.readFileSync(new URL('./fixtures/demo.json', import.meta.url), 'utf8')));
   const st = createStore(data);
   const call = (method, path, body) => st.handle(method, path, new URLSearchParams(), body, { admin: true });
   const is21 = data.groups.find(g => g.name === 'ИС-21');

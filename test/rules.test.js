@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { createStore } from '../js/store.js';
 import { validateDay, computeProgress } from '../js/logic.js';
 
-const demo = JSON.parse(fs.readFileSync(new URL('../data.json', import.meta.url), 'utf8'));
+const demo = JSON.parse(fs.readFileSync(new URL('./fixtures/demo.json', import.meta.url), 'utf8'));
 const ADMIN = { admin: true };
 const GUEST = { admin: false };
 
@@ -123,4 +123,34 @@ test('гость видит только утверждённое расписа
   assert.equal(view('1', ADMIN).lessons.length, 6);
   call('POST', `/day/${date}/approve`);
   assert.equal(view('0', GUEST).lessons.length, 6);
+});
+
+test('удаление группы убирает её план, расписание и предметы, которых нет у других групп', () => {
+  const { call, data, id } = setup();
+  call('POST', `/groups/${id('groups', 'name', 'ИС-22')}/subjects`, { name: 'Только у ИС-22' });
+  const bu = data.groups.find(g => g.name === 'БУ-21');
+  call('POST', `/groups/${bu.id}/subjects`, { name: 'Общий предмет' });
+  const is22 = id('groups', 'name', 'ИС-22');
+  call('POST', `/groups/${is22}/subjects`, { name: 'общий предмет' }); // тот же предмет, другой регистр
+  call('DELETE', `/groups/${is22}`);
+
+  assert.ok(!data.groups.some(g => g.id === is22));
+  assert.ok(!data.curriculum.some(c => c.group_id === is22));
+  assert.ok(!data.lessons.some(l => l.group_id === is22));
+  const names = data.subjects.map(s => s.name);
+  assert.ok(!names.includes('Только у ИС-22'), 'предмет только этой группы удалён');
+  assert.ok(names.includes('Общий предмет'), 'предмет, который есть у БУ-21, остался');
+  assert.ok(names.includes('Программирование'), 'предмет есть у ИС-21 — остался');
+  assert.ok(data.curriculum.every(c => data.subjects.some(s => s.id === c.subject_id)));
+});
+
+test('предмет группы: добавление с часами, повтор запрещён, «Убрать» удаляет ненужный предмет', () => {
+  const { call, data, is21 } = setup();
+  call('POST', `/groups/${is21.id}/subjects`, { name: 'Черчение', plan: { h_practice: 68, semester: 2 } });
+  const subj = data.subjects.find(s => s.name === 'Черчение');
+  const item = data.curriculum.find(c => c.group_id === is21.id && c.subject_id === subj.id);
+  assert.deepEqual([item.h_practice, item.semester, item.teacher_id], [68, 2, null]);
+  assert.throws(() => call('POST', `/groups/${is21.id}/subjects`, { name: 'черчение' }), /уже есть/);
+  call('DELETE', `/curriculum/${item.id}`);
+  assert.ok(!data.subjects.some(s => s.name === 'Черчение'));
 });

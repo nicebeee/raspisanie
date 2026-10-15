@@ -171,3 +171,12 @@ td.cell:hover .add-hint { color: var(--accent); }
   .topbar { gap: 12px; padding: 0 16px; }
   .toolbar select { max-width: 100%; }
 }
+
+/* Вкладки групп */
+.subtabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 16px; }
+.subtabs button {
+  border: 1px solid var(--border); background: var(--surface); color: var(--text);
+  padding: 6px 14px; border-radius: 99px; cursor: pointer; font: inherit;
+}
+.subtabs button:hover { border-color: #b9c0cc; }
+.subtabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }

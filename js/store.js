@@ -156,19 +156,30 @@ export function createStore(data) {
       for (const c of data.curriculum) if (c.teacher_id === id) c.teacher_id = null;
       for (const l of data.lessons) if (l.teacher_id === id) l.teacher_id = null;
     },
+    // Группа удаляется целиком: её план, расписание и предметы, которые больше нигде не нужны.
     groups(id) {
+      const used = new Set(data.curriculum.filter(c => c.group_id === id).map(c => c.subject_id));
       data.curriculum = data.curriculum.filter(c => c.group_id !== id);
       removeLessons(l => l.group_id === id);
+      dropUnusedSubjects(used);
     },
     subjects(id) {
       const gone = new Set(data.curriculum.filter(c => c.subject_id === id).map(c => c.id));
       data.curriculum = data.curriculum.filter(c => c.subject_id !== id);
       removeLessons(l => gone.has(l.curriculum_id));
     },
-    curriculum(id) {
+    curriculum(id, item) {
       removeLessons(l => l.curriculum_id === id);
+      dropUnusedSubjects([item.subject_id]);
     },
   };
+
+  // Предмет живёт, пока он есть в плане хотя бы одной группы.
+  function dropUnusedSubjects(ids) {
+    const still = new Set(data.curriculum.map(c => c.subject_id));
+    const gone = new Set([...ids].filter(id => !still.has(id)));
+    if (gone.size) data.subjects = data.subjects.filter(s => !gone.has(s.id));
+  }
 
   for (const [name, def] of Object.entries(TABLES)) {
     on('POST', `/${name}`, (_, body) => {
@@ -194,12 +205,35 @@ export function createStore(data) {
     on('DELETE', `/${name}/:id`, ({ id }) => {
       const i = list(name).findIndex(x => x.id === Number(id));
       if (i >= 0) {
-        list(name).splice(i, 1);
-        onDelete[name](Number(id));
+        const [item] = list(name).splice(i, 1);
+        onDelete[name](Number(id), item);
       }
       return { ok: true };
     });
   }
+
+  // Добавить предмет в группу: предмет с таким названием переиспользуется, иначе создаётся.
+  // В план группы он попадает без часов — их задают во вкладке «Учебный план».
+  on('POST', '/groups/:id/subjects', ({ id }, body) => {
+    const group = find(data.groups, id);
+    if (!group) throw bad('Группа не найдена');
+    const row = clean(TABLES.subjects, body);
+    let subj = data.subjects.find(s => s.name.toLowerCase() === row.name.toLowerCase());
+    if (!subj) {
+      subj = { id: nextId(), ...row };
+      data.subjects.push(subj);
+    } else if (row.room_type) {
+      subj.room_type = row.room_type;
+    }
+    if (data.curriculum.some(c => c.group_id === group.id && c.subject_id === subj.id)) {
+      throw bad(`«${subj.name}» уже есть у группы ${group.name}`);
+    }
+    // Можно сразу передать часы, преподавателя и т.п. — как у строки учебного плана.
+    const plan = clean(TABLES.curriculum, { semester: null, ...body.plan, group_id: group.id, subject_id: subj.id });
+    checkRefs('curriculum', plan);
+    data.curriculum.push({ id: nextId(), ...plan });
+    return { id: subj.id };
+  });
 
   // Отсутствия хранятся без причины: файл данных публичный.
   on('POST', '/absences', (_, body) => {

@@ -33,6 +33,7 @@ const state = {
   day: null,
   planGroup: Number(store('planGroup')) || null,
   planSemester: 0,
+  groupTab: Number(store('groupTab')) || null,
   view: { type: store('viewType') || 'group', id: Number(store('viewId')) || null, week: null, drafts: false },
 };
 
@@ -890,8 +891,13 @@ function editPlanItem(g, c) {
   const hasSub = g.subgroups.length > 0;
 
   modal(c ? 'Предмет в учебном плане' : `Новый предмет для ${g.name}`, [
-    field('Предмет', select([['', '— выберите —'], ...ref.subjects.map(s => [s.id, s.name])], v.subject_id, x => { v.subject_id = x; }),
-      'Список предметов — во вкладке «Группы и предметы».'),
+    c
+      ? field('Предмет', el('input', { value: subjName(c), disabled: true }), 'Переименовать предмет можно во вкладке «Группы и предметы».')
+      : field('Предмет', el('input', { list: 'plan-subject-names', placeholder: 'Название предмета', oninput: e => { v.subject_name = e.target.value; } }),
+        'Выберите из списка или впишите новое название.'),
+    c ? null : el('datalist', { id: 'plan-subject-names' }, ref.subjects
+      .filter(x => !ref.curriculum.some(p => p.group_id === g.id && p.subject_id === x.id))
+      .map(x => el('option', { value: x.name }))),
     el('div', { class: 'row' },
       field('Преподаватель', select([['', '— не назначен —'], ...ref.teachers.map(t => [t.id, t.short_name])], v.teacher_id, x => { v.teacher_id = x; })),
       field('Семестр', select([['', 'Весь год'], [1, '1 семестр'], [2, '2 семестр']], v.semester ?? '', x => { v.semester = x ? Number(x) : null; }))),
@@ -912,7 +918,8 @@ function editPlanItem(g, c) {
     el('button', {
       class: 'btn primary',
       onclick: () => quiet(async () => {
-        await api(c ? 'PUT' : 'POST', c ? `/curriculum/${c.id}` : '/curriculum', v);
+        if (c) await api('PUT', `/curriculum/${c.id}`, v);
+        else await api('POST', `/groups/${g.id}/subjects`, { name: v.subject_name, plan: v });
         await reload();
         close();
         render();
@@ -1222,32 +1229,81 @@ function editRoom(r) {
 // ---------- Группы и предметы ----------
 
 async function renderGroups(main) {
+  if (!group(state.groupTab)) state.groupTab = ref.groups[0]?.id ?? null;
+  const g = group(state.groupTab);
+  const pick = id => { state.groupTab = id; store('groupTab', id); render(); };
+
+  const head = el('div', { class: 'toolbar' }, el('h2', { style: 'margin:0' }, 'Группы и предметы'), el('div', { class: 'spacer' }),
+    el('button', { class: 'btn', onclick: () => importPlan(null) }, 'Загрузить план из Excel…'),
+    el('button', { class: 'btn primary', onclick: () => editGroup(null) }, 'Добавить группу'));
+  if (!g) {
+    mount(main, head, el('div', { class: 'card' }, 'Групп пока нет. Добавьте группу или загрузите учебный план из Excel — группа создастся сама.'));
+    return;
+  }
+
+  const items = ref.curriculum.filter(c => c.group_id === g.id).sort((a, b) => subjName(a).localeCompare(subjName(b), 'ru'));
+  const othersWith = subjectId => ref.curriculum
+    .filter(c => c.subject_id === subjectId && c.group_id !== g.id).map(c => group(c.group_id)?.name).filter(Boolean);
+
   mount(main,
-    el('div', { class: 'toolbar' }, el('h2', { style: 'margin:0' }, 'Группы'), el('div', { class: 'spacer' }),
-      el('button', { class: 'btn primary', onclick: () => editGroup(null) }, 'Добавить группу')),
+    head,
+    el('div', { class: 'subtabs', role: 'tablist' }, ref.groups.map(x =>
+      el('button', { class: x.id === g.id ? 'active' : '', role: 'tab', 'aria-selected': String(x.id === g.id), onclick: () => pick(x.id) }, x.name))),
+    el('div', { class: 'card', style: 'display:grid;gap:6px;margin-bottom:16px' },
+      el('div', { class: 'toolbar', style: 'margin:0' },
+        el('h3', { style: 'margin:0;font-size:18px' }, g.name), el('div', { class: 'spacer' }),
+        el('button', { class: 'btn small', onclick: () => editGroup(g) }, 'Изменить группу'),
+        el('button', { class: 'btn small danger', onclick: () => deleteGroup(g) }, 'Удалить группу')),
+      el('div', { class: 'muted' }, [g.specialty || 'Специальность не указана', g.course ? g.course + ' курс' : '', g.size ? g.size + ' чел.' : ''].filter(Boolean).join(' · ')),
+      el('div', { class: 'muted' }, 'Подгруппы: ', g.subgroups.map(x => x.name).join(', ') || 'не делится')),
+    el('div', { class: 'toolbar' }, el('h3', { style: 'margin:0' }, `Предметы группы (${items.length})`), el('div', { class: 'spacer' }),
+      el('button', { class: 'btn', onclick: () => { state.planGroup = g.id; store('planGroup', g.id); state.tab = 'plan'; store('tab', 'plan'); history.replaceState(null, '', '#plan'); render(); } }, 'Часы и преподаватели — в учебном плане'),
+      el('button', { class: 'btn primary', onclick: () => editSubject(null, g) }, 'Добавить предмет')),
     el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Группа'), el('th', {}, 'Специальность'), el('th', { class: 'num' }, 'Курс'),
-        el('th', { class: 'num' }, 'Студентов'), el('th', {}, 'Подгруппы'), el('th', {}))),
-      el('tbody', {}, ref.groups.map(g => el('tr', {},
-        el('td', { style: 'font-weight:600' }, g.name),
-        el('td', {}, g.specialty || '—'),
-        el('td', { class: 'num' }, g.course ?? '—'),
-        el('td', { class: 'num' }, g.size ?? '—'),
-        el('td', {}, g.subgroups.map(s => s.name).join(', ') || el('span', { class: 'muted' }, 'не делится')),
-        el('td', { class: 'row-actions' },
-          el('button', { class: 'btn small', onclick: () => editGroup(g) }, 'Изменить'), ' ',
-          el('button', { class: 'btn small danger', onclick: () => removeRow('groups', g.id, `Удалить группу ${g.name} вместе с учебным планом и расписанием?`) }, 'Удалить'))))))),
-    el('div', { class: 'toolbar', style: 'margin-top:28px' }, el('h2', { style: 'margin:0' }, 'Предметы'), el('div', { class: 'spacer' }),
-      el('button', { class: 'btn primary', onclick: () => editSubject(null) }, 'Добавить предмет')),
-    el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Предмет'), el('th', {}, 'Нужный тип аудитории'), el('th', {}))),
-      el('tbody', {}, ref.subjects.map(s => el('tr', {},
-        el('td', {}, s.name),
-        el('td', {}, s.room_type || el('span', { class: 'muted' }, 'любая')),
-        el('td', { class: 'row-actions' },
-          el('button', { class: 'btn small', onclick: () => editSubject(s) }, 'Изменить'), ' ',
-          el('button', { class: 'btn small danger', onclick: () => removeRow('subjects', s.id, `Удалить предмет «${s.name}» из всех учебных планов?`) }, 'Удалить'))))))),
+      el('thead', {}, el('tr', {}, el('th', {}, 'Предмет'), el('th', {}, 'Нужный тип аудитории'), el('th', { class: 'num' }, 'Часов по плану'),
+        el('th', {}, 'Преподаватель'), el('th', {}, 'Есть также у групп'), el('th', {}))),
+      el('tbody', {}, items.length ? items.map(c => {
+        const subj = subject(c.subject_id);
+        return el('tr', {},
+          el('td', { style: 'font-weight:600' }, subj?.name ?? '?'),
+          el('td', {}, subj?.room_type || el('span', { class: 'muted' }, 'любая')),
+          el('td', { class: 'num' }, c.h_lecture + c.h_practice + c.h_lab),
+          el('td', {}, teacher(c.teacher_id)?.short_name ?? '—'),
+          el('td', { class: 'small' }, othersWith(c.subject_id).join(', ') || el('span', { class: 'muted' }, '—')),
+          el('td', { class: 'row-actions' },
+            el('button', { class: 'btn small', onclick: () => editSubject(subj, g) }, 'Изменить'), ' ',
+            el('button', { class: 'btn small danger', onclick: () => removeFromGroup(g, c) }, 'Убрать')));
+      }) : el('tr', {}, el('td', { colspan: 6, class: 'muted' }, 'У группы пока нет предметов. Добавьте их или загрузите учебный план из Excel.'))))),
   );
+}
+
+function lessonsCount(pred) {
+  return db.data.lessons.filter(pred).length;
+}
+
+async function deleteGroup(g) {
+  const plan = ref.curriculum.filter(c => c.group_id === g.id).length;
+  const lessons = lessonsCount(l => l.group_id === g.id);
+  const msg = `Удалить группу ${g.name} целиком?\n\nВместе с ней удалятся: предметов в плане — ${plan}, пар в расписании — ${lessons}. ` +
+    'Предметы, которых нет у других групп, тоже удалятся.';
+  if (!confirm(msg)) return;
+  await quiet(async () => {
+    await api('DELETE', `/groups/${g.id}`);
+    await reload();
+    state.groupTab = ref.groups[0]?.id ?? null;
+    render();
+    toast(`Группа ${g.name} удалена. Нажмите «Сохранить», чтобы изменения попали на сайт`);
+  });
+}
+
+async function removeFromGroup(g, c) {
+  const lessons = lessonsCount(l => l.curriculum_id === c.id);
+  if (!confirm(`Убрать «${subjName(c)}» у группы ${g.name}?` + (lessons ? ` Удалятся и пары по нему в расписании (${lessons}).` : ''))) return;
+  await quiet(async () => {
+    await api('DELETE', `/curriculum/${c.id}`);
+    await reload();
+    render();
+  });
 }
 
 function editGroup(g) {
@@ -1274,7 +1330,9 @@ function editGroup(g) {
     el('button', {
       class: 'btn primary',
       onclick: () => quiet(async () => {
-        await api(g ? 'PUT' : 'POST', g ? `/groups/${g.id}` : '/groups', { ...v, subgroups: subs });
+        const r = await api(g ? 'PUT' : 'POST', g ? `/groups/${g.id}` : '/groups', { ...v, subgroups: subs });
+        state.groupTab = r.id;
+        store('groupTab', r.id);
         await reload();
         close();
         render();
@@ -1283,18 +1341,27 @@ function editGroup(g) {
   ]);
 }
 
-function editSubject(s) {
-  const v = s ? { ...s } : { name: '', room_type: '' };
-  modal(s ? 'Предмет' : 'Новый предмет', [
-    field('Название', el('input', { value: v.name, oninput: e => { v.name = e.target.value; } })),
+// s — существующий предмет (правка) или null (новый предмет для группы g).
+function editSubject(s, g) {
+  const v = s ? { name: s.name, room_type: s.room_type } : { name: '', room_type: '' };
+  const shared = s ? ref.curriculum.filter(c => c.subject_id === s.id).map(c => group(c.group_id)?.name).filter(Boolean) : [];
+  const listId = 'subject-names';
+  const nameInput = el('input', { value: v.name, list: s ? null : listId, oninput: e => { v.name = e.target.value; } });
+  modal(s ? `Предмет «${s.name}»` : `Новый предмет для ${g.name}`, [
+    field('Название', nameInput, s ? null : 'Можно выбрать уже существующий предмет — тогда он просто добавится в план группы.'),
+    s ? null : el('datalist', { id: listId }, ref.subjects
+      .filter(x => !ref.curriculum.some(c => c.group_id === g.id && c.subject_id === x.id))
+      .map(x => el('option', { value: x.name }))),
     field('Нужный тип аудитории', select([['', 'Любая'], ...ROOM_TYPES.map(x => [x, x])], v.room_type, x => { v.room_type = x; }),
       'Например, лабораторные по информатике — только в компьютерном классе.'),
+    shared.length > 1 ? el('div', { class: 'notice warn' }, `Этот предмет есть у нескольких групп (${shared.join(', ')}) — изменения коснутся всех.`) : null,
+    s ? null : el('p', { class: 'hint', style: 'margin:0' }, 'Предмет добавится в учебный план группы без часов — часы и преподавателя задайте во вкладке «Учебный план».'),
   ], close => [
     el('button', { class: 'btn', onclick: close }, 'Отмена'),
     el('button', {
       class: 'btn primary',
       onclick: () => quiet(async () => {
-        await api(s ? 'PUT' : 'POST', s ? `/subjects/${s.id}` : '/subjects', v);
+        await api(s ? 'PUT' : 'POST', s ? `/subjects/${s.id}` : `/groups/${g.id}/subjects`, v);
         await reload();
         close();
         render();
