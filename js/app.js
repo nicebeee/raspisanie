@@ -96,7 +96,8 @@ async function api(method, path, body) {
 function toast(msg, kind = 'info') {
   const item = el('div', { class: 'toast-item ' + kind }, msg);
   $('#toast').append(item);
-  setTimeout(() => item.remove(), kind === 'error' ? 6000 : 3000);
+  // Длинные сообщения об ошибках держим дольше, чтобы их успели прочитать.
+  setTimeout(() => item.remove(), kind === 'error' ? Math.max(6000, msg.length * 70) : 3000);
 }
 
 async function guard(fn) {

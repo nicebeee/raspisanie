@@ -30,6 +30,13 @@ async function call(conn, path, opts = {}) {
   if (res.status === 409 || (res.status === 422 && opts.method === 'PUT')) {
     throw new ConflictError('Данные на GitHub уже изменились');
   }
+  if (res.status === 403 && opts.method !== 'PUT' && res.headers.get('x-ratelimit-remaining') === '0') {
+    throw new Error('GitHub временно ограничил число запросов — попробуйте через несколько минут');
+  }
+  if (res.status === 403) {
+    throw new Error('У токена не хватает прав. Откройте токен на GitHub → Edit: Repository access — «Only select repositories» с этим репозиторием, ' +
+      'Permissions → Contents — «Read and write». Сохраните (Update) и войдите на сайте заново');
+  }
   if (res.status === 404) throw new Error('Репозиторий не найден или у токена нет к нему доступа');
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
