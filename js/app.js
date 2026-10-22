@@ -419,6 +419,7 @@ function drawDay(main = $('#main')) {
     el('span', { class: 'badge ' + (approved ? 'ok' : 'draft') }, approved ? 'Утверждено' : 'Черновик'),
     el('div', { class: 'spacer' }),
     !approved && !active.length && el('button', { class: 'btn', onclick: copyPrevWeek }, 'Скопировать с прошлой недели'),
+    el('button', { class: 'btn', onclick: openAutoSchedule }, 'Автосоставление…'),
     !approved && d.lessons.length > 0 && el('button', { class: 'btn', onclick: clearDay }, 'Очистить'),
     el('button', { class: 'btn', onclick: () => window.print() }, 'Печать'),
     approved
@@ -530,6 +531,106 @@ async function dayAction(action) {
     await reload();
     drawDay();
   });
+}
+
+// ---------- Автосоставление ----------
+
+async function openAutoSchedule() {
+  const monday = mondayOf(state.date);
+  const week = [0, 1, 2, 3, 4, 5].map(i => addDays(monday, i));
+  const v = {
+    period: 'day',
+    pairs: ref.settings.max_pairs,
+    maxSame: 2,
+    off: new Set(), // группы, с которых сняли галочку
+  };
+  let check = await api('GET', '/auto/check');
+  const body = el('div', { style: 'display:grid;gap:14px' });
+
+  const assignTeacher = (curriculumId, teacherId) => quiet(async () => {
+    const item = planItem(curriculumId);
+    await api('PUT', `/curriculum/${curriculumId}`, { ...item, teacher_id: teacherId ? Number(teacherId) : null });
+    await reload();
+    check = await api('GET', '/auto/check');
+    draw();
+  });
+
+  function draw() {
+    const rows = ref.groups.map(g => {
+      const c = check.find(x => x.group_id === g.id) ?? { ready: false, missing: [], pairsLeft: 0 };
+      const usable = c.ready;
+      const on = usable && !v.off.has(g.id);
+      let status;
+      if (c.missing.length) {
+        status = el('div', { style: 'display:grid;gap:6px' },
+          el('div', { style: 'color:var(--err);font-weight:600' }, 'Укажите преподавателя, чтобы составить расписание:'),
+          c.missing.map(m => el('div', { class: 'toolbar', style: 'margin:0' },
+            el('span', { style: 'min-width:180px' }, m.subject),
+            select([['', '— выберите преподавателя —'], ...ref.teachers.filter(t => t.active).map(t => [t.id, t.short_name])], '',
+              x => { if (x) assignTeacher(m.curriculum_id, x); }))));
+      } else if (!c.pairsLeft) {
+        status = el('span', { class: 'muted' }, ref.curriculum.some(x => x.group_id === g.id) ? 'все часы плана уже расставлены' : 'нет учебного плана');
+      } else {
+        status = el('span', { style: 'color:var(--ok)' }, `готова · осталось ${c.pairsLeft} ${plural(c.pairsLeft, ['пара', 'пары', 'пар'])}`);
+      }
+      return el('tr', {},
+        el('td', {}, el('input', {
+          type: 'checkbox', checked: on, disabled: !usable, 'aria-label': g.name,
+          onchange: e => { if (e.target.checked) v.off.delete(g.id); else v.off.add(g.id); draw(); },
+        })),
+        el('td', { style: 'font-weight:600' }, g.name),
+        el('td', {}, status));
+    });
+    const chosen = ref.groups.filter(g => check.find(x => x.group_id === g.id)?.ready && !v.off.has(g.id));
+
+    mount(body,
+      el('div', { class: 'row' },
+        field('Период', select([['day', `Этот день — ${DAY_SHORT[weekday(state.date) - 1]}, ${fmtShort(state.date)}`], ['week', `Вся неделя — ${fmtShort(week[0])}–${fmtShort(week[5])}`]], v.period, x => { v.period = x; })),
+        field('Пар в день у группы', select(Array.from({ length: ref.settings.max_pairs }, (_, i) => [i + 1, String(i + 1)]), v.pairs, x => { v.pairs = Number(x); })),
+        field('Один предмет — не больше пар в день', select([[1, '1'], [2, '2'], [3, '3']], v.maxSame, x => { v.maxSame = Number(x); }))),
+      el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
+        el('thead', {}, el('tr', {}, el('th', {}), el('th', {}, 'Группа'), el('th', {}, 'Готовность'))),
+        el('tbody', {}, rows.length ? rows : el('tr', {}, el('td', { colspan: 3, class: 'muted' }, 'Групп пока нет.'))))),
+      el('p', { class: 'hint', style: 'margin:0' },
+        'Пары ставятся подряд, без окон, с учётом доступности и занятости преподавателей, закреплённых аудиторий и подгрупп. ' +
+        'В первую очередь — предметы, по которым осталось больше часов. Дни, где у группы уже есть пары, и утверждённые дни не меняются. ' +
+        'Результат — черновик: проверьте и утвердите.'));
+    const btn = $('#auto-submit');
+    if (btn) { btn.disabled = !chosen.length; btn.textContent = chosen.length ? `Составить (${chosen.length} ${plural(chosen.length, ['группа', 'группы', 'групп'])})` : 'Составить'; }
+  }
+
+  modal('Автосоставление расписания', body, close => [
+    el('button', { class: 'btn', onclick: close }, 'Отмена'),
+    el('button', {
+      class: 'btn primary', id: 'auto-submit',
+      onclick: () => quiet(async () => {
+        const groupIds = ref.groups.filter(g => check.find(x => x.group_id === g.id)?.ready && !v.off.has(g.id)).map(g => g.id);
+        const dates = v.period === 'week' ? week : [state.date];
+        const r = await api('POST', '/auto', { dates, group_ids: groupIds, pairs_per_day: v.pairs, max_same: v.maxSame });
+        await reload();
+        state.day = await api('GET', `/day/${state.date}`);
+        close();
+        drawDay();
+        showAutoReport(r);
+      }),
+    }, 'Составить'),
+  ], { wide: true });
+  draw();
+}
+
+function showAutoReport(r) {
+  const notes = r.report.filter(x => x.placed === 0 && x.note);
+  modal(r.created ? `Поставлено пар: ${r.created}` : 'Ничего не поставлено', [
+    r.created ? el('p', { style: 'margin:0' }, 'Расписание сохранено как черновик. Проверьте его по дням, при необходимости поправьте и утвердите. Не забудьте «Сохранить».') : null,
+    el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'День'), el('th', {}, 'Группа'), el('th', { class: 'num' }, 'Пар в день'), el('th', {}, 'Примечание'))),
+      el('tbody', {}, r.report.map(x => el('tr', {},
+        el('td', {}, `${DAY_SHORT[weekday(x.date) - 1]}, ${fmtShort(x.date)}`),
+        el('td', {}, x.group ?? '—'),
+        el('td', { class: 'num' }, x.placed ?? '—'),
+        el('td', { class: 'small' }, x.note || '')))))),
+    notes.length ? el('p', { class: 'hint', style: 'margin:0' }, 'Если пар меньше, чем нужно, обычно не хватает свободных преподавателей в эти часы — проверьте их доступность во вкладке «Преподаватели».') : null,
+  ], close => [el('button', { class: 'btn primary', onclick: close }, 'Понятно')], { wide: true });
 }
 
 async function copyPrevWeek() {

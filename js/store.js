@@ -1,6 +1,7 @@
 // Все действия с данными расписания. Данные — один объект (содержимое data.json),
 // интерфейс обращается к нему через handle(method, path, ...) по тем же адресам, что раньше были у сервера.
 import { KINDS, computeProgress, settingsOf, validateDay } from './logic.js';
+import { autoSchedule, groupReadiness } from './autoschedule.js';
 
 export class StoreError extends Error {
   constructor(message, status = 400) {
@@ -456,6 +457,27 @@ export function createStore(data) {
     removeLessons(l => l.date === date);
     log(date, 'Очистка', `Расписание на ${fmtDate(date)} очищено`);
     return dayPayload(date);
+  });
+
+  // ---------- Автосоставление ----------
+
+  // Готовность групп: у предметов с оставшимися часами должны быть преподаватели.
+  on('GET', '/auto/check', () => data.groups.map(g => ({ group_id: g.id, ...groupReadiness(data, g.id) })));
+
+  on('POST', '/auto', (_, body) => {
+    const dates = (Array.isArray(body.dates) ? body.dates : []).map(checkDate);
+    const groupIds = (Array.isArray(body.group_ids) ? body.group_ids : []).map(Number);
+    if (!dates.length) throw bad('Не выбраны дни');
+    if (!groupIds.length) throw bad('Не выбраны группы');
+    const notReady = groupIds.map(id => find(data.groups, id)).filter(g => g && groupReadiness(data, g.id).missing.length);
+    if (notReady.length) throw bad(`Сначала укажите преподавателей у предметов групп: ${notReady.map(g => g.name).join(', ')}`);
+    const r = autoSchedule(data, { dates, groupIds, pairsPerDay: Number(body.pairs_per_day) || undefined, maxSameSubject: Number(body.max_same) || undefined });
+    for (const l of r.lessons) {
+      ensureDay(l.date);
+      data.lessons.push({ id: nextId(), ...l });
+    }
+    if (r.lessons.length) log(dates.length === 1 ? dates[0] : null, 'Автосоставление', `Поставлено пар: ${r.lessons.length} (${dates.map(fmtDate).join(', ')})`);
+    return { created: r.lessons.length, report: r.report };
   });
 
   // ---------- Просмотр и отчёты ----------
