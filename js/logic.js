@@ -6,8 +6,12 @@ export const KIND_NAMES = { lecture: 'Лекция', practice: 'Практиче
 
 export const DEFAULT_SETTINGS = {
   pairs_per_day: 6,
-  max_pairs: 4,
+  min_pairs: 4, // у группы/подгруппы в день: не меньше (предупреждение) …
+  max_pairs: 6, // … и не больше (ошибка)
   teacher_max_pairs: 4,
+  study_days: 5, // учебных дней в неделе: 5 (пн–пт) или 6 (пн–сб)
+  semester1_end: null, // последний день 1-го семестра, ГГГГ-ММ-ДД
+  semester2_end: null, // последний день 2-го семестра
   hours_per_pair: 2,
   bells: [
     { pair: 1, start: '08:30', end: '10:00' },
@@ -19,7 +23,34 @@ export const DEFAULT_SETTINGS = {
   ],
 };
 
-export const settingsOf = data => ({ ...DEFAULT_SETTINGS, ...data.settings });
+export function settingsOf(data) {
+  const saved = { ...data.settings };
+  // Старый формат: был только «максимум пар» = 4. Переходим на «от 4 до 6».
+  if (saved.min_pairs === undefined) delete saved.max_pairs;
+  return { ...DEFAULT_SETTINGS, ...saved };
+}
+
+// Какой сейчас семестр по датам окончания из настроек (1, 2 или null, если даты не заданы).
+export function semesterOf(data, date) {
+  const s = settingsOf(data);
+  if (s.semester1_end && date <= s.semester1_end) return 1;
+  if (s.semester2_end && date <= s.semester2_end) return 2;
+  return null;
+}
+
+// Сколько учебных дней осталось до конца текущего семестра, включая date (null — даты не заданы).
+export function studyDaysLeft(data, date) {
+  const s = settingsOf(data);
+  const sem = semesterOf(data, date);
+  const end = sem === 1 ? s.semester1_end : sem === 2 ? s.semester2_end : null;
+  if (!end) return null;
+  let n = 0;
+  for (let d = new Date(date + 'T00:00:00Z'); d.toISOString().slice(0, 10) <= end; d.setUTCDate(d.getUTCDate() + 1)) {
+    const wd = d.getUTCDay() === 0 ? 7 : d.getUTCDay();
+    if (wd <= s.study_days) n++;
+  }
+  return n;
+}
 
 // 1 = понедельник … 7 = воскресенье
 export function weekdayOf(date) {
@@ -205,7 +236,10 @@ export function validateDay(data, date) {
       if (!pairs.length) continue;
       if (pairs.length > s.max_pairs) {
         add('error', `${st.name}: ${pairs.length} пар за день, допустимо не более ${s.max_pairs}`, st.ls, g.id);
+      } else if (pairs.length < s.min_pairs) {
+        add('warning', `${st.name}: ${pairs.length} ${pairs.length === 1 ? 'пара' : 'пары'} за день, нужно не меньше ${s.min_pairs}`, st.ls, g.id);
       }
+      if (pairs[0] > 1) add('warning', `${st.name}: пары начинаются с ${pairs[0]}-й, а не с 1-й`, st.ls, g.id);
       const gaps = [];
       for (let p = pairs[0]; p <= pairs[pairs.length - 1]; p++) if (!pairs.includes(p)) gaps.push(p);
       if (gaps.length) {

@@ -36,8 +36,9 @@ test('окно у подгруппы — ошибка', () => {
   assert.ok(errors().some(e => e.includes('Подгруппа 2') && e.includes('окно на 5-й')));
 });
 
-test('больше 4 пар у подгруппы — ошибка', () => {
-  const { cell, errors, subs, plan, id } = setup();
+test('больше максимума пар у подгруппы — ошибка (максимум 4 в настройках)', () => {
+  const { cell, errors, subs, plan, id, data } = setup();
+  data.settings = { ...data.settings, min_pairs: 1, max_pairs: 4 };
   cell(4, [
     { subgroup_id: subs[0], curriculum_id: plan('Иностранный язык'), kind: 'practice', room_id: id('rooms', 'name', '305') },
     { subgroup_id: subs[1], curriculum_id: plan('Программирование'), kind: 'lab', teacher_id: id('teachers', 'short_name', 'Козлов Д.А.') },

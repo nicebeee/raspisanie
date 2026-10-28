@@ -27,7 +27,7 @@ test('составленная неделя проходит все провер
 
 test('лимит пар в день и «один предмет — не больше N» соблюдаются', () => {
   const { data, call, all } = setup();
-  call('POST', '/auto', { dates: NEXT_WEEK, group_ids: all, pairs_per_day: 3, max_same: 1 });
+  call('POST', '/auto', { dates: NEXT_WEEK, group_ids: all, min_pairs: 3, max_pairs: 3, max_same: 1 });
   for (const d of NEXT_WEEK) {
     for (const g of data.groups) {
       const streams = g.subgroups.length ? g.subgroups.map(s => s.id) : [0];

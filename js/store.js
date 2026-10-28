@@ -331,7 +331,15 @@ export function createStore(data) {
 
   on('PUT', '/settings', (_, body) => {
     const s = settingsOf(data);
+    const minPairs = Number(body.min_pairs ?? s.min_pairs);
     const maxPairs = Number(body.max_pairs ?? s.max_pairs);
+    if (!(Number.isInteger(minPairs) && minPairs >= 1 && minPairs <= maxPairs)) throw bad('Минимум пар — от 1 и не больше максимума');
+    const studyDays = Number(body.study_days ?? s.study_days);
+    if (![5, 6].includes(studyDays)) throw bad('Учебных дней в неделе — 5 или 6');
+    const sem1 = body.semester1_end === undefined ? s.semester1_end : (body.semester1_end || null);
+    const sem2 = body.semester2_end === undefined ? s.semester2_end : (body.semester2_end || null);
+    for (const d of [sem1, sem2]) if (d) checkDate(d);
+    if (sem1 && sem2 && sem2 <= sem1) throw bad('Конец 2-го семестра должен быть позже конца 1-го');
     const teacherMax = Number(body.teacher_max_pairs ?? s.teacher_max_pairs);
     if (!(Number.isInteger(teacherMax) && teacherMax >= 1 && teacherMax <= s.pairs_per_day)) throw bad(`Пар у преподавателя в день — от 1 до ${s.pairs_per_day}`);
     const hpp = Number(body.hours_per_pair ?? s.hours_per_pair);
@@ -342,7 +350,7 @@ export function createStore(data) {
         bells.some(b => !/^\d{2}:\d{2}$/.test(b.start) || !/^\d{2}:\d{2}$/.test(b.end))) {
       throw bad('Сетка звонков заполнена неверно');
     }
-    data.settings = { ...data.settings, max_pairs: maxPairs, teacher_max_pairs: teacherMax, hours_per_pair: hpp, bells: bells.map((b, i) => ({ pair: i + 1, start: b.start, end: b.end })) };
+    data.settings = { ...data.settings, min_pairs: minPairs, max_pairs: maxPairs, teacher_max_pairs: teacherMax, study_days: studyDays, semester1_end: sem1, semester2_end: sem2, hours_per_pair: hpp, bells: bells.map((b, i) => ({ pair: i + 1, start: b.start, end: b.end })) };
     return settingsOf(data);
   });
 
@@ -492,7 +500,10 @@ export function createStore(data) {
     if (!groupIds.length) throw bad('Не выбраны группы');
     const notReady = groupIds.map(id => find(data.groups, id)).filter(g => g && groupReadiness(data, g.id).missing.length);
     if (notReady.length) throw bad(`Сначала укажите преподавателей у предметов групп: ${notReady.map(g => g.name).join(', ')}`);
-    const r = autoSchedule(data, { dates, groupIds, pairsPerDay: Number(body.pairs_per_day) || undefined, maxSameSubject: Number(body.max_same) || undefined });
+    const r = autoSchedule(data, {
+      dates, groupIds, minPairs: Number(body.min_pairs) || undefined, maxPairs: Number(body.max_pairs) || undefined,
+      maxSameSubject: Number(body.max_same) || undefined,
+    });
     for (const l of r.lessons) {
       ensureDay(l.date);
       data.lessons.push({ id: nextId(), ...l });
