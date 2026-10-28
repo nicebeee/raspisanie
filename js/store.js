@@ -1,6 +1,6 @@
 // Все действия с данными расписания. Данные — один объект (содержимое data.json),
 // интерфейс обращается к нему через handle(method, path, ...) по тем же адресам, что раньше были у сервера.
-import { KINDS, computeProgress, settingsOf, validateDay } from './logic.js';
+import { KINDS, KIND_NAMES, computeProgress, settingsOf, teacherFor, unitKey, unitsOfItem, validateDay } from './logic.js';
 import { autoSchedule, groupReadiness } from './autoschedule.js';
 
 export class StoreError extends Error {
@@ -31,13 +31,14 @@ const LABELS = {
 // Справочники: какие поля принимаем и какого они типа ("!" — обязательное).
 const TABLES = {
   rooms: { fields: { name: 'text!', building: 'text', capacity: 'int', type: 'text' } },
-  subjects: { fields: { name: 'text!', room_type: 'text' }, unique: 'name' },
+  subjects: { fields: { name: 'text!', short: 'text', room_type: 'text' }, unique: 'name' },
   teachers: { fields: { full_name: 'text!', short_name: 'text!', room_id: 'int', active: 'bool' } },
   groups: { fields: { name: 'text!', specialty: 'text', course: 'int', size: 'int' }, unique: 'name' },
   curriculum: {
     fields: {
       group_id: 'int!', subject_id: 'int!', teacher_id: 'int', semester: 'int',
       h_lecture: 'int', h_practice: 'int', h_lab: 'int', split_practice: 'bool', split_lab: 'bool',
+      done_lecture: 'int', done_practice: 'int', done_lab: 'int',
     },
   },
 };
@@ -64,7 +65,7 @@ function clean(def, body) {
     if (required && v === null) throw bad(`Заполните поле «${LABELS[f] ?? f}»`);
     if (v === null && type === 'bool') v = f === 'active' ? 1 : 0;
     if (v === null && type === 'text') v = '';
-    if (v === null && f.startsWith('h_')) v = 0;
+    if (v === null && (f.startsWith('h_') || f.startsWith('done_'))) v = 0;
     out[f] = v;
   }
   return out;
@@ -131,6 +132,19 @@ export function createStore(data) {
         return { weekday: wd, pair_from: from, pair_to: to };
       }).sort((a, b) => a.weekday - b.weekday);
     },
+    // Отдельные преподаватели для видов занятий и подгрупп; совпадающие с основным не храним.
+    curriculum(item, body) {
+      if (body.teachers === undefined) return;
+      const next = {};
+      for (const [key, value] of Object.entries(body.teachers ?? {})) {
+        if (!/^(lecture|practice|lab)(:\d+)?$/.test(key)) continue;
+        const tid = value ? Number(value) : null;
+        if (!tid || tid === item.teacher_id) continue;
+        if (!find(data.teachers, tid)) throw bad('Преподаватель не найден');
+        next[key] = tid;
+      }
+      item.teachers = next;
+    },
     groups(g, body) {
       g.subgroups ??= [];
       if (!Array.isArray(body.subgroups)) return;
@@ -154,7 +168,10 @@ export function createStore(data) {
       for (const l of data.lessons) if (l.room_id === id) l.room_id = null;
     },
     teachers(id) {
-      for (const c of data.curriculum) if (c.teacher_id === id) c.teacher_id = null;
+      for (const c of data.curriculum) {
+        if (c.teacher_id === id) c.teacher_id = null;
+        for (const [k, v] of Object.entries(c.teachers ?? {})) if (v === id) delete c.teachers[k];
+      }
       for (const l of data.lessons) if (l.teacher_id === id) l.teacher_id = null;
     },
     // Группа удаляется целиком: её план, расписание и предметы, которые больше нигде не нужны.
@@ -232,7 +249,9 @@ export function createStore(data) {
     // Можно сразу передать часы, преподавателя и т.п. — как у строки учебного плана.
     const plan = clean(TABLES.curriculum, { semester: null, ...body.plan, group_id: group.id, subject_id: subj.id });
     checkRefs('curriculum', plan);
-    data.curriculum.push({ id: nextId(), ...plan });
+    const item = { id: nextId(), ...plan };
+    afterSave.curriculum(item, body.plan ?? {});
+    data.curriculum.push(item);
     return { id: subj.id };
   });
 
@@ -313,6 +332,8 @@ export function createStore(data) {
   on('PUT', '/settings', (_, body) => {
     const s = settingsOf(data);
     const maxPairs = Number(body.max_pairs ?? s.max_pairs);
+    const teacherMax = Number(body.teacher_max_pairs ?? s.teacher_max_pairs);
+    if (!(Number.isInteger(teacherMax) && teacherMax >= 1 && teacherMax <= s.pairs_per_day)) throw bad(`Пар у преподавателя в день — от 1 до ${s.pairs_per_day}`);
     const hpp = Number(body.hours_per_pair ?? s.hours_per_pair);
     const bells = body.bells ?? s.bells;
     if (!(Number.isInteger(maxPairs) && maxPairs >= 1 && maxPairs <= s.pairs_per_day)) throw bad(`Лимит пар — от 1 до ${s.pairs_per_day}`);
@@ -321,7 +342,7 @@ export function createStore(data) {
         bells.some(b => !/^\d{2}:\d{2}$/.test(b.start) || !/^\d{2}:\d{2}$/.test(b.end))) {
       throw bad('Сетка звонков заполнена неверно');
     }
-    data.settings = { ...data.settings, max_pairs: maxPairs, hours_per_pair: hpp, bells: bells.map((b, i) => ({ pair: i + 1, start: b.start, end: b.end })) };
+    data.settings = { ...data.settings, max_pairs: maxPairs, teacher_max_pairs: teacherMax, hours_per_pair: hpp, bells: bells.map((b, i) => ({ pair: i + 1, start: b.start, end: b.end })) };
     return settingsOf(data);
   });
 
@@ -361,7 +382,7 @@ export function createStore(data) {
       if (!item['h_' + x.kind]) throw bad('В плане нет часов этого вида занятий');
       const sid = x.subgroup_id ? Number(x.subgroup_id) : null;
       if (sid !== null && !subIds.has(sid)) throw bad('Подгруппа не найдена');
-      const teacherId = x.teacher_id ? Number(x.teacher_id) : item.teacher_id;
+      const teacherId = x.teacher_id ? Number(x.teacher_id) : teacherFor(item, x.kind, x.subgroup_id);
       const teacher = teacherId ? find(data.teachers, teacherId) : null;
       if (teacherId && !teacher) throw bad('Преподаватель не найден');
       // Преподаватель с закреплённой аудиторией всегда ведёт занятия в ней.
@@ -496,32 +517,48 @@ export function createStore(data) {
     };
   }, { public: true });
 
+  // Нагрузка: по каждому преподавателю — его предметы (группа × вид занятий × подгруппа) с часами.
+  // «Проведено» — внесённые вручную часы и утверждённые пары; «за месяц» — по фактическим парам преподавателя.
   on('GET', '/report/teachers', () => {
     const s = settingsOf(data);
-    const subCount = new Map(data.groups.map(g => [g.id, g.subgroups.length]));
-    const plannedH = new Map();
+    const hpp = s.hours_per_pair;
+    const progress = computeProgress(data);
+    const groups = new Map(data.groups.map(g => [g.id, g]));
+    const items = new Map(data.teachers.map(t => [t.id, []]));
     for (const c of data.curriculum) {
-      if (!c.teacher_id) continue;
-      const n = subCount.get(c.group_id) ?? 0;
-      const h = c.h_lecture + c.h_practice * (c.split_practice && n ? n : 1) + c.h_lab * (c.split_lab && n ? n : 1);
-      plannedH.set(c.teacher_id, (plannedH.get(c.teacher_id) ?? 0) + h);
+      const g = groups.get(c.group_id);
+      for (const { kind, sid } of unitsOfItem(c, g)) {
+        const tid = teacherFor(c, kind, sid);
+        if (!items.has(tid)) continue;
+        items.get(tid).push({
+          group: g?.name ?? '?',
+          subject: find(data.subjects, c.subject_id)?.name ?? '?',
+          kind: KIND_NAMES[kind],
+          subgroup: sid ? g.subgroups.find(x => x.id === sid)?.name ?? '' : '',
+          planned_h: c['h_' + kind],
+          done_h: Math.round((progress[unitKey(c.id, kind, sid)] ?? 0) * hpp),
+        });
+      }
     }
     const monthStart = new Date().toISOString().slice(0, 8) + '01';
-    const done = new Map(), month = new Map();
+    const month = new Map();
     for (const l of data.lessons) {
-      if (l.status !== 'active' || dayStatus(l.date) !== 'approved' || !l.teacher_id) continue;
-      done.set(l.teacher_id, (done.get(l.teacher_id) ?? 0) + 1);
-      if (l.date >= monthStart) month.set(l.teacher_id, (month.get(l.teacher_id) ?? 0) + 1);
+      if (l.status !== 'active' || dayStatus(l.date) !== 'approved' || !l.teacher_id || l.date < monthStart) continue;
+      month.set(l.teacher_id, (month.get(l.teacher_id) ?? 0) + 1);
     }
     return {
-      hours_per_pair: s.hours_per_pair,
-      rows: [...data.teachers].sort((a, b) => a.short_name.localeCompare(b.short_name, 'ru')).map(t => ({
-        id: t.id,
-        name: t.short_name,
-        planned_h: plannedH.get(t.id) ?? 0,
-        done_h: (done.get(t.id) ?? 0) * s.hours_per_pair,
-        month_h: (month.get(t.id) ?? 0) * s.hours_per_pair,
-      })),
+      hours_per_pair: hpp,
+      rows: [...data.teachers].sort((a, b) => a.short_name.localeCompare(b.short_name, 'ru')).map(t => {
+        const list = items.get(t.id).sort((a, b) => a.group.localeCompare(b.group, 'ru', { numeric: true }) || a.subject.localeCompare(b.subject, 'ru'));
+        return {
+          id: t.id,
+          name: t.short_name,
+          planned_h: list.reduce((x, i) => x + i.planned_h, 0),
+          done_h: list.reduce((x, i) => x + i.done_h, 0),
+          month_h: (month.get(t.id) ?? 0) * hpp,
+          items: list,
+        };
+      }),
     };
   });
 

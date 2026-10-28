@@ -7,6 +7,7 @@ export const KIND_NAMES = { lecture: 'Лекция', practice: 'Практиче
 export const DEFAULT_SETTINGS = {
   pairs_per_day: 6,
   max_pairs: 4,
+  teacher_max_pairs: 4,
   hours_per_pair: 2,
   bells: [
     { pair: 1, start: '08:30', end: '10:00' },
@@ -34,13 +35,40 @@ export function isSplitKind(item, kind, subgroupCount) {
 
 export const unitKey = (curriculumId, kind, subgroupId) => `${curriculumId}|${kind}|${subgroupId || 0}`;
 
-// Сколько пар проведено по каждой единице плана (предмет × вид × подгруппа).
-// Учитываются утверждённые дни; extraDate добавляет черновик этого дня.
-export function computeProgress(data, extraDate = null) {
+// Кто ведёт вид занятий у подгруппы: отдельное назначение для подгруппы, для вида занятий,
+// иначе основной преподаватель предмета. item.teachers = { lecture: id, practice: id, 'lab:<id подгруппы>': id, … }
+export function teacherFor(item, kind, subgroupId = 0) {
+  const t = item.teachers ?? {};
+  return t[`${kind}:${subgroupId || 0}`] ?? t[kind] ?? item.teacher_id ?? null;
+}
+
+// Единицы плана: предмет × вид занятий × подгруппа (0 — вся группа).
+export function unitsOfItem(item, group) {
+  const out = [];
+  for (const kind of KINDS) {
+    if (!item['h_' + kind]) continue;
+    const sids = isSplitKind(item, kind, group?.subgroups.length) ? group.subgroups.map(s => s.id) : [0];
+    for (const sid of sids) out.push({ kind, sid });
+  }
+  return out;
+}
+
+// Сколько пар проведено по каждой единице плана (предмет × вид × подгруппа):
+// часы, внесённые вручную как «уже проведено» (done_*), плюс пары из расписания.
+// Из расписания учитываются утверждённые дни; extraDate добавляет черновик этого дня, allDrafts — все черновики.
+export function computeProgress(data, extraDate = null, { allDrafts = false } = {}) {
+  const hpp = settingsOf(data).hours_per_pair;
+  const groups = new Map(data.groups.map(g => [g.id, g]));
   const out = {};
+  for (const item of data.curriculum) {
+    for (const { kind, sid } of unitsOfItem(item, groups.get(item.group_id))) {
+      const done = (item['done_' + kind] ?? 0) / hpp;
+      if (done) out[unitKey(item.id, kind, sid)] = done;
+    }
+  }
   for (const l of data.lessons) {
     if (l.status !== 'active') continue;
-    if (data.days[l.date]?.status !== 'approved' && l.date !== extraDate) continue;
+    if (!allDrafts && data.days[l.date]?.status !== 'approved' && l.date !== extraDate) continue;
     const k = unitKey(l.curriculum_id, l.kind, l.subgroup_id);
     out[k] = (out[k] ?? 0) + 1;
   }
@@ -183,6 +211,25 @@ export function validateDay(data, date) {
       if (gaps.length) {
         add('error', `${st.name}: окно на ${gaps.join(', ')}-й паре — пары должны идти подряд`, st.ls, g.id);
       }
+    }
+  }
+
+  // Преподаватель — не больше teacher_max_pairs пар в день (во всех группах вместе)
+  for (const ls of groupBy(lessons, l => l.teacher_id)) {
+    const pairs = new Set(ls[1].map(l => l.pair));
+    if (pairs.size > s.teacher_max_pairs) {
+      add('error', `${tName(ls[0])}: ${pairs.size} пар за день, допустимо не более ${s.teacher_max_pairs}`, ls[1]);
+    }
+  }
+
+  // У подгрупп одной группы в один день должны быть одинаковые предметы (в любом порядке)
+  for (const g of data.groups) {
+    if (g.subgroups.length < 2) continue;
+    const sets = g.subgroups.map(sg => lessons
+      .filter(l => l.group_id === g.id && (!l.subgroup_id || l.subgroup_id === sg.id))
+      .map(l => curriculum.get(l.curriculum_id)?.subject_id).sort().join(','));
+    if (sets.some(x => x) && new Set(sets).size > 1) {
+      add('warning', `${g.name}: у подгрупп в этот день разные предметы — обычно у них одни и те же предметы в разном порядке`, [], g.id);
     }
   }
 

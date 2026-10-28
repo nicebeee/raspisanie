@@ -180,3 +180,7 @@ td.cell:hover .add-hint { color: var(--accent); }
 }
 .subtabs button:hover { border-color: #b9c0cc; }
 .subtabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+/* Нагрузка: строки предметов под преподавателем */
+tr.load-row:hover td { background: #f8f9ff; }
+tr.load-detail td { background: #fafbfc; font-size: 13px; }

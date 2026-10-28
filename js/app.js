@@ -1,6 +1,7 @@
 import { createStore } from './store.js';
 import * as gh from './github.js';
 import { parsePlanWorkbook, guessCourse, planForCourse } from './plan-import.js';
+import { teacherFor } from './logic.js';
 
 const KINDS = ['lecture', 'practice', 'lab'];
 const KIND_NAMES = { lecture: 'Лекция', practice: 'Практическое', lab: 'Лабораторная' };
@@ -140,6 +141,8 @@ const group = id => ref.byId.groups.get(id);
 const subject = id => ref.byId.subjects.get(id);
 const planItem = id => ref.byId.curriculum.get(id);
 const subjName = item => subject(item?.subject_id)?.name ?? '?';
+// В сетке расписания и при печати — сокращённое название, если оно задано.
+const subjShort = item => { const x = subject(item?.subject_id); return x?.short || x?.name || '?'; };
 
 function subShort(sg) {
   const m = sg.name.match(/\d+/);
@@ -515,13 +518,13 @@ function cellTd(g, pair) {
 function lessonBlock(l) {
   const t = teacher(l.teacher_id), r = room(l.room_id);
   return el('div', { class: 'lesson' },
-    el('div', { class: 'l-subj' }, subjName(planItem(l.curriculum_id)), ' ', el('span', { class: 'l-kind' }, KIND_SHORT[l.kind])),
+    el('div', { class: 'l-subj', title: subjName(planItem(l.curriculum_id)) }, subjShort(planItem(l.curriculum_id)), ' ', el('span', { class: 'l-kind' }, KIND_SHORT[l.kind])),
     el('div', { class: 'l-meta' }, t?.short_name ?? 'нет преподавателя', ' · ', r ? 'ауд. ' + r.name : 'нет аудитории'));
 }
 
 function lessonText(l) {
   const sg = l.subgroup_id ? ref.subgroups.get(l.subgroup_id) : null;
-  return `${sg ? subShort(sg) + ': ' : ''}${subjName(planItem(l.curriculum_id))} ${KIND_SHORT[l.kind]}`;
+  return `${sg ? subShort(sg) + ': ' : ''}${subjShort(planItem(l.curriculum_id))} ${KIND_SHORT[l.kind]}`;
 }
 
 async function dayAction(action) {
@@ -756,13 +759,19 @@ function openCellEditor(g, pair) {
       field('Предмет', select([['', s.sg ? '— нет пары у подгруппы —' : '— нет пары —'], ...itemOptions], s.curriculum_id, v => {
         s.curriculum_id = v;
         const it = planItem(Number(v));
-        s.teacher_id = it?.teacher_id ?? '';
+        s.kind = it ? s.kinds()[0] ?? '' : '';
+        s.teacher_id = it ? teacherFor(it, s.kind, s.sg?.id) ?? '' : '';
         s.room_id = '';
-        if (it && !teacher(it.teacher_id)?.room_id) s.room_id = suggestRoom(it, s) ?? '';
+        if (it && !teacher(Number(s.teacher_id))?.room_id) s.room_id = suggestRoom(it, s) ?? '';
         redraw();
       })),
       item ? el('div', { class: 'row' },
-        field('Вид занятия', select(kindOptions, s.kind, v => { s.kind = v; redraw(); })),
+        field('Вид занятия', select(kindOptions, s.kind, v => {
+          s.kind = v;
+          s.teacher_id = teacherFor(item, v, s.sg?.id) ?? '';
+          if (!teacher(Number(s.teacher_id))?.room_id) s.room_id = suggestRoom(item, s) ?? '';
+          redraw();
+        })),
         field('Преподаватель', select(teacherOptions, s.teacher_id, v => {
           s.teacher_id = v;
           if (!teacher(Number(v))?.room_id) s.room_id = suggestRoom(item, s) ?? '';
@@ -869,7 +878,7 @@ async function renderView(main) {
     if (v.type !== 'teacher') bits.push(teacher(l.teacher_id)?.short_name ?? '');
     if (v.type !== 'room') bits.push(room(l.room_id) ? 'ауд. ' + room(l.room_id).name : '');
     return el('div', { class: l.status === 'cancelled' ? 'cancelled' : 'lesson' },
-      el('div', { class: 'l-subj' }, subjName(planItem(l.curriculum_id)), ' ', el('span', { class: 'l-kind' }, KIND_SHORT[l.kind])),
+      el('div', { class: 'l-subj', title: subjName(planItem(l.curriculum_id)) }, subjShort(planItem(l.curriculum_id)), ' ', el('span', { class: 'l-kind' }, KIND_SHORT[l.kind])),
       el('div', { class: 'l-meta' }, bits.filter(Boolean).join(' · ')),
       l.day_status !== 'approved' ? el('div', { class: 'draft-mark' }, 'черновик') : null);
   };
@@ -945,7 +954,7 @@ async function renderPlan(main) {
       el('td', {}, el('div', { style: 'font-weight:600' }, subjName(c)),
         el('div', { class: 'muted small' }, st.parts.join(' · ')),
         splitNote.length ? el('div', { class: 'muted small' }, 'По подгруппам: ' + splitNote.join(', ')) : null),
-      el('td', {}, teacher(c.teacher_id)?.short_name ?? '—'),
+      el('td', {}, teachersOfItem(c).join(', ') || '—'),
       el('td', { class: 'num' }, c.semester ?? '1–2'),
       el('td', { class: 'num' }, hours),
       KINDS.map(k => el('td', { class: 'num' }, c['h_' + k] || '—')),
@@ -984,17 +993,41 @@ async function renderPlan(main) {
 }
 
 function editPlanItem(g, c) {
-  const v = c ? { ...c } : { group_id: g.id, subject_id: '', teacher_id: '', semester: 1, h_lecture: 0, h_practice: 0, h_lab: 0, split_practice: 0, split_lab: 0 };
+  const v = c
+    ? { ...c, teachers: { ...(c.teachers ?? {}) } }
+    : { group_id: g.id, subject_id: '', teacher_id: '', semester: null, h_lecture: 0, h_practice: 0, h_lab: 0, split_practice: 0, split_lab: 0, done_lecture: 0, done_practice: 0, done_lab: 0, teachers: {} };
   const hpp = ref.settings.hours_per_pair;
-  const total = el('strong');
-  const updateTotal = () => {
-    const sum = ['h_lecture', 'h_practice', 'h_lab'].reduce((s, k) => s + (Number(v[k]) || 0), 0);
-    const odd = ['h_lecture', 'h_practice', 'h_lab'].some(k => (Number(v[k]) || 0) % hpp);
-    total.textContent = `${sum} ч = ${fmtNum(sum / hpp)} пар` + (odd ? ` · часы не делятся на ${hpp} — будет неполная пара` : '');
-  };
-  updateTotal();
-  const num = key => el('input', { type: 'number', min: 0, step: hpp, value: v[key], oninput: e => { v[key] = e.target.value; updateTotal(); } });
   const hasSub = g.subgroups.length > 0;
+  const total = el('strong');
+  const who = el('div', { style: 'display:grid;gap:6px' });
+
+  const updateTotal = () => {
+    const sum = KINDS.reduce((x, k) => x + (Number(v['h_' + k]) || 0), 0);
+    const done = KINDS.reduce((x, k) => x + (Number(v['done_' + k]) || 0), 0);
+    const odd = KINDS.some(k => (Number(v['h_' + k]) || 0) % hpp);
+    total.textContent = `${sum} ч = ${fmtNum(sum / hpp)} пар` + (done ? ` · уже проведено ${done} ч` : '') +
+      (odd ? ` · часы не делятся на ${hpp} — будет неполная пара` : '');
+  };
+  // Кто ведёт: для каждого вида занятий (и подгруппы, если делится) — свой преподаватель или основной.
+  const drawWho = () => {
+    const main = teacher(Number(v.teacher_id));
+    const opts = [['', `как основной${main ? ` (${main.short_name})` : ''}`], ...ref.teachers.filter(t => t.active || Object.values(v.teachers).includes(t.id)).map(t => [t.id, t.short_name])];
+    const rows = [];
+    for (const k of KINDS) {
+      if (!(Number(v['h_' + k]) > 0)) continue;
+      const split = hasSub && ((k === 'practice' && v.split_practice) || (k === 'lab' && v.split_lab));
+      const keys = split ? g.subgroups.map(sg => [`${k}:${sg.id}`, `${KIND_NAMES[k]} — ${sg.name}`]) : [[k, KIND_NAMES[k]]];
+      for (const [key, label] of keys) {
+        rows.push(el('div', { class: 'toolbar', style: 'margin:0' },
+          el('span', { style: 'min-width:220px' }, label),
+          select(opts, v.teachers[key] ?? '', x => { if (x) v.teachers[key] = Number(x); else delete v.teachers[key]; })));
+      }
+    }
+    mount(who, rows.length ? rows : el('span', { class: 'hint' }, 'Укажите часы — появятся строки для преподавателей.'));
+  };
+  const num = (key, onChange) => el('input', { type: 'number', min: 0, step: hpp, value: v[key] ?? 0, oninput: e => { v[key] = e.target.value; updateTotal(); onChange?.(); } });
+  updateTotal();
+  drawWho();
 
   modal(c ? 'Предмет в учебном плане' : `Новый предмет для ${g.name}`, [
     c
@@ -1005,20 +1038,31 @@ function editPlanItem(g, c) {
       .filter(x => !ref.curriculum.some(p => p.group_id === g.id && p.subject_id === x.id))
       .map(x => el('option', { value: x.name }))),
     el('div', { class: 'row' },
-      field('Преподаватель', select([['', '— не назначен —'], ...ref.teachers.map(t => [t.id, t.short_name])], v.teacher_id, x => { v.teacher_id = x; })),
+      field('Основной преподаватель', select([['', '— не назначен —'], ...ref.teachers.map(t => [t.id, t.short_name])], v.teacher_id, x => { v.teacher_id = x; drawWho(); })),
       field('Семестр', select([['', 'Весь год'], [1, '1 семестр'], [2, '2 семестр']], v.semester ?? '', x => { v.semester = x ? Number(x) : null; }))),
     el('div', { class: 'row' },
-      field(KIND_COL.lecture, num('h_lecture')),
-      field(KIND_COL.practice, num('h_practice')),
-      field(KIND_COL.lab, num('h_lab'))),
+      field(KIND_COL.lecture, num('h_lecture', drawWho)),
+      field(KIND_COL.practice, num('h_practice', drawWho)),
+      field(KIND_COL.lab, num('h_lab', drawWho))),
+    el('div', { class: 'field' },
+      el('span', { class: 'field-label' }, 'Уже проведено (до начала работы в программе), ч'),
+      el('div', { class: 'row' },
+        field('Лекции', num('done_lecture')),
+        field('Практические', num('done_practice')),
+        field('Лабораторные', num('done_lab'))),
+      el('span', { class: 'hint' }, 'Эти часы сразу вычитаются из остатка. Для занятий по подгруппам — сколько прошла каждая подгруппа.')),
     el('div', {}, 'Всего: ', total),
     el('div', { class: 'field' },
       el('span', { class: 'field-label' }, 'Деление на подгруппы'),
-      el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!v.split_practice, disabled: !hasSub, onchange: e => { v.split_practice = e.target.checked; } }), 'Практические занятия по подгруппам'),
-      el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!v.split_lab, disabled: !hasSub, onchange: e => { v.split_lab = e.target.checked; } }), 'Лабораторные занятия по подгруппам'),
+      el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!v.split_practice, disabled: !hasSub, onchange: e => { v.split_practice = e.target.checked; drawWho(); } }), 'Практические занятия по подгруппам'),
+      el('label', { class: 'check' }, el('input', { type: 'checkbox', checked: !!v.split_lab, disabled: !hasSub, onchange: e => { v.split_lab = e.target.checked; drawWho(); } }), 'Лабораторные занятия по подгруппам'),
       el('span', { class: 'hint' }, hasSub
         ? 'Для каждой подгруппы ведётся свой счётчик пар — каждая должна пройти все часы.'
         : 'У группы нет подгрупп — их можно добавить во вкладке «Группы и предметы».')),
+    el('div', { class: 'field' },
+      el('span', { class: 'field-label' }, 'Кто ведёт'),
+      who,
+      el('span', { class: 'hint' }, 'Например, лекции ведёт один преподаватель, практические — другой, или у подгрупп разные преподаватели.')),
   ], close => [
     el('button', { class: 'btn', onclick: close }, 'Отмена'),
     el('button', {
@@ -1031,7 +1075,13 @@ function editPlanItem(g, c) {
         render();
       }),
     }, 'Сохранить'),
-  ]);
+  ], { wide: true });
+}
+
+// Все преподаватели строки плана: основной и назначенные на виды занятий/подгруппы.
+function teachersOfItem(c) {
+  const ids = [c.teacher_id, ...Object.values(c.teachers ?? {})].filter(Boolean);
+  return [...new Set(ids)].map(id => teacher(id)?.short_name).filter(Boolean);
 }
 
 // ---------- Загрузка учебного плана из Excel ----------
@@ -1366,20 +1416,21 @@ async function renderGroups(main) {
       el('button', { class: 'btn', onclick: () => { state.planGroup = g.id; store('planGroup', g.id); state.tab = 'plan'; store('tab', 'plan'); history.replaceState(null, '', '#plan'); render(); } }, 'Часы и преподаватели — в учебном плане'),
       el('button', { class: 'btn primary', onclick: () => editSubject(null, g) }, 'Добавить предмет')),
     el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Предмет'), el('th', {}, 'Нужный тип аудитории'), el('th', { class: 'num' }, 'Часов по плану'),
+      el('thead', {}, el('tr', {}, el('th', {}, 'Предмет'), el('th', {}, 'Сокращение'), el('th', {}, 'Нужный тип аудитории'), el('th', { class: 'num' }, 'Часов по плану'),
         el('th', {}, 'Преподаватель'), el('th', {}, 'Есть также у групп'), el('th', {}))),
       el('tbody', {}, items.length ? items.map(c => {
         const subj = subject(c.subject_id);
         return el('tr', {},
           el('td', { style: 'font-weight:600' }, subj?.name ?? '?'),
+          el('td', {}, subj?.short || el('span', { class: 'muted' }, '—')),
           el('td', {}, subj?.room_type || el('span', { class: 'muted' }, 'любая')),
           el('td', { class: 'num' }, c.h_lecture + c.h_practice + c.h_lab),
-          el('td', {}, teacher(c.teacher_id)?.short_name ?? '—'),
+          el('td', {}, teachersOfItem(c).join(', ') || '—'),
           el('td', { class: 'small' }, othersWith(c.subject_id).join(', ') || el('span', { class: 'muted' }, '—')),
           el('td', { class: 'row-actions' },
             el('button', { class: 'btn small', onclick: () => editSubject(subj, g) }, 'Изменить'), ' ',
             el('button', { class: 'btn small danger', onclick: () => removeFromGroup(g, c) }, 'Убрать')));
-      }) : el('tr', {}, el('td', { colspan: 6, class: 'muted' }, 'У группы пока нет предметов. Добавьте их или загрузите учебный план из Excel.'))))),
+      }) : el('tr', {}, el('td', { colspan: 7, class: 'muted' }, 'У группы пока нет предметов. Добавьте их или загрузите учебный план из Excel.'))))),
   );
 }
 
@@ -1449,15 +1500,22 @@ function editGroup(g) {
 
 // s — существующий предмет (правка) или null (новый предмет для группы g).
 function editSubject(s, g) {
-  const v = s ? { name: s.name, room_type: s.room_type } : { name: '', room_type: '' };
+  const v = s ? { name: s.name, short: s.short ?? '', room_type: s.room_type } : { name: '', short: '', room_type: '' };
   const shared = s ? ref.curriculum.filter(c => c.subject_id === s.id).map(c => group(c.group_id)?.name).filter(Boolean) : [];
   const listId = 'subject-names';
   const nameInput = el('input', { value: v.name, list: s ? null : listId, oninput: e => { v.name = e.target.value; } });
+  const shortInput = el('div', { class: 'toolbar', style: 'margin:0' },
+    el('input', { value: v.short, maxlength: 30, placeholder: 'например, БЖД', oninput: e => { v.short = e.target.value; } }),
+    el('button', {
+      class: 'btn small', type: 'button',
+      onclick: e => { v.short = abbreviate(v.name); e.target.previousSibling.value = v.short; },
+    }, 'Предложить'));
   modal(s ? `Предмет «${s.name}»` : `Новый предмет для ${g.name}`, [
     field('Название', nameInput, s ? null : 'Можно выбрать уже существующий предмет — тогда он просто добавится в план группы.'),
     s ? null : el('datalist', { id: listId }, ref.subjects
       .filter(x => !ref.curriculum.some(c => c.group_id === g.id && c.subject_id === x.id))
       .map(x => el('option', { value: x.name }))),
+    field('Сокращение для расписания', shortInput, 'Так предмет будет написан в сетке расписания и при печати, например «БЖД», «Англ. яз.».'),
     field('Нужный тип аудитории', select([['', 'Любая'], ...ROOM_TYPES.map(x => [x, x])], v.room_type, x => { v.room_type = x; }),
       'Например, лабораторные по информатике — только в компьютерном классе.'),
     shared.length > 1 ? el('div', { class: 'notice warn' }, `Этот предмет есть у нескольких групп (${shared.join(', ')}) — изменения коснутся всех.`) : null,
@@ -1480,39 +1538,70 @@ function editSubject(s, g) {
 
 async function renderReport(main) {
   const r = await api('GET', '/report/teachers');
+  state.openLoad ??= new Set();
+  const pctBar = (done, planned) => {
+    if (!planned) return el('span', { class: 'muted small' }, 'нет часов в плане');
+    const pct = Math.min(100, Math.round((done / planned) * 100));
+    return el('div', { style: 'display:flex;align-items:center;gap:8px' }, el('div', { class: 'bar' }, el('span', { style: `width:${pct}%` })), `${pct}%`);
+  };
+  const rows = [];
+  for (const x of r.rows) {
+    const open = state.openLoad.has(x.id);
+    rows.push(el('tr', { class: 'load-row', style: x.items.length ? 'cursor:pointer' : '', onclick: () => { if (!x.items.length) return; open ? state.openLoad.delete(x.id) : state.openLoad.add(x.id); render(); } },
+      el('td', {}, x.items.length ? el('span', { class: 'muted', style: 'display:inline-block;width:16px' }, open ? '▾' : '▸') : el('span', { style: 'display:inline-block;width:16px' }),
+        el('span', { style: 'font-weight:600' }, x.name), x.items.length ? el('span', { class: 'muted small' }, ` · предметов: ${x.items.length}`) : null),
+      el('td', { class: 'num' }, x.planned_h),
+      el('td', { class: 'num' }, x.done_h),
+      el('td', { class: 'num' }, x.month_h),
+      el('td', { class: 'num' }, Math.max(0, x.planned_h - x.done_h)),
+      el('td', {}, pctBar(x.done_h, x.planned_h))));
+    if (open) {
+      for (const i of x.items) {
+        rows.push(el('tr', { class: 'load-detail' },
+          el('td', { style: 'padding-left:34px' }, `${i.subject}`, el('div', { class: 'muted small' }, [i.group, i.kind.toLowerCase(), i.subgroup].filter(Boolean).join(' · '))),
+          el('td', { class: 'num' }, i.planned_h),
+          el('td', { class: 'num' }, i.done_h),
+          el('td', {}),
+          el('td', { class: 'num' }, Math.max(0, i.planned_h - i.done_h)),
+          el('td', {}, pctBar(i.done_h, i.planned_h))));
+      }
+    }
+  }
   mount(main,
     el('div', { class: 'toolbar' }, el('h2', { style: 'margin:0' }, 'Нагрузка преподавателей'), el('div', { class: 'spacer' }),
+      el('button', { class: 'btn no-print', onclick: () => { r.rows.forEach(x => x.items.length && state.openLoad.add(x.id)); render(); } }, 'Раскрыть все'),
+      el('button', { class: 'btn no-print', onclick: () => { state.openLoad.clear(); render(); } }, 'Свернуть'),
       el('button', { class: 'btn no-print', onclick: () => window.print() }, 'Печать')),
     el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Преподаватель'), el('th', { class: 'num' }, 'По плану, ч'),
+      el('thead', {}, el('tr', {}, el('th', {}, 'Преподаватель / предмет'), el('th', { class: 'num' }, 'По плану, ч'),
         el('th', { class: 'num' }, 'Проведено, ч'), el('th', { class: 'num' }, 'За этот месяц, ч'),
         el('th', { class: 'num' }, 'Осталось, ч'), el('th', {}, 'Выполнение'))),
-      el('tbody', {}, r.rows.map(x => {
-        const pct = x.planned_h ? Math.min(100, Math.round((x.done_h / x.planned_h) * 100)) : 0;
-        return el('tr', {},
-          el('td', {}, x.name),
-          el('td', { class: 'num' }, x.planned_h),
-          el('td', { class: 'num' }, x.done_h),
-          el('td', { class: 'num' }, x.month_h),
-          el('td', { class: 'num' }, Math.max(0, x.planned_h - x.done_h)),
-          el('td', {}, x.planned_h ? el('div', { style: 'display:flex;align-items:center;gap:8px' },
-            el('div', { class: 'bar' }, el('span', { style: `width:${pct}%` })), `${pct}%`) : el('span', { class: 'muted small' }, 'нет часов в плане')));
-      })))),
-    el('p', { class: 'hint' }, '«По плану» — часы из учебных планов, где преподаватель указан основным (пары по подгруппам считаются для каждой подгруппы). «Проведено» — по утверждённым дням, в том числе замены.'),
+      el('tbody', {}, rows))),
+    el('p', { class: 'hint' }, 'Нажмите на преподавателя, чтобы увидеть его предметы по группам и видам занятий. ' +
+      '«По плану» — часы, где он назначен вести (основной преподаватель или назначенный на вид занятий/подгруппу; занятия по подгруппам — для каждой подгруппы). ' +
+      '«Проведено» — внесённые вручную часы и утверждённые дни.'),
   );
+}
+
+// Сокращение по первым буквам значимых слов: «Безопасность жизнедеятельности» → «БЖ».
+function abbreviate(name) {
+  const words = String(name).split(/[\s-]+/).filter(w => w.length > 2 || /^[А-ЯA-Z]/.test(w));
+  if (words.length === 1) return words[0].length > 6 ? words[0].slice(0, 5) + '.' : words[0];
+  return words.map(w => w[0].toUpperCase()).join('').slice(0, 6);
 }
 
 // ---------- Настройки ----------
 
 async function renderSettings(main) {
   const s = ref.settings;
-  const v = { max_pairs: s.max_pairs, hours_per_pair: s.hours_per_pair, bells: s.bells.map(b => ({ ...b })) };
+  const v = { max_pairs: s.max_pairs, teacher_max_pairs: s.teacher_max_pairs, hours_per_pair: s.hours_per_pair, bells: s.bells.map(b => ({ ...b })) };
   const log = await api('GET', '/log');
   mount(main,
     el('h2', {}, 'Настройки'),
     el('div', { class: 'card', style: 'max-width:640px;display:grid;gap:14px' },
       el('div', { class: 'row' },
         field('Максимум пар в день у группы/подгруппы', select(Array.from({ length: s.pairs_per_day }, (_, i) => [i + 1, String(i + 1)]), v.max_pairs, x => { v.max_pairs = Number(x); })),
+        field('Максимум пар в день у преподавателя', select(Array.from({ length: s.pairs_per_day }, (_, i) => [i + 1, String(i + 1)]), v.teacher_max_pairs, x => { v.teacher_max_pairs = Number(x); })),
         field('Академических часов в одной паре', select([[1, '1'], [2, '2'], [3, '3'], [4, '4']], v.hours_per_pair, x => { v.hours_per_pair = Number(x); }))),
       el('div', { class: 'field' }, el('span', { class: 'field-label' }, 'Звонки'),
         el('table', { class: 'avail-table' }, el('tbody', {}, v.bells.map(b => el('tr', {},
