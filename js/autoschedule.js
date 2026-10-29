@@ -91,7 +91,7 @@ export function autoSchedule(data, options) {
   const P = s.pairs_per_day;
   const MIN = Math.min(P, Math.max(1, options.minPairs ?? s.min_pairs));
   const MAX = Math.min(P, Math.max(MIN, options.maxPairs ?? s.max_pairs));
-  const maxSame = Math.max(1, options.maxSameSubject ?? 2);
+  const maxSame = Math.max(1, options.maxSameSubject ?? s.max_same_subject);
   const used = usedCounts(data);
   const teachers = new Map(data.teachers.map(t => [t.id, t]));
   const teacherIds = new Set(teachers.keys());

@@ -545,7 +545,6 @@ async function openAutoSchedule() {
     period: 'day',
     minPairs: ref.settings.min_pairs,
     maxPairs: ref.settings.max_pairs,
-    maxSame: 2,
     off: new Set(), // группы, с которых сняли галочку
   };
   let check = await api('GET', '/auto/check');
@@ -594,7 +593,9 @@ async function openAutoSchedule() {
           'от', select(Array.from({ length: ref.settings.pairs_per_day }, (_, i) => [i + 1, String(i + 1)]), v.minPairs, x => { v.minPairs = Number(x); if (v.maxPairs < v.minPairs) v.maxPairs = v.minPairs; draw(); }),
           'до', select(Array.from({ length: ref.settings.pairs_per_day }, (_, i) => [i + 1, String(i + 1)]).filter(([n]) => n >= v.minPairs), v.maxPairs, x => { v.maxPairs = Number(x); })),
           ref.settings.semester1_end ? 'Сколько именно — по темпу до конца семестра' : 'Без дат семестров в настройках ставится минимум'),
-        field('Один предмет — не больше пар в день', select([[1, '1'], [2, '2'], [3, '3']], v.maxSame, x => { v.maxSame = Number(x); }))),
+        field('Один предмет в день', el('div', { style: 'padding:7px 0' },
+          ref.settings.max_same_subject === 1 ? 'не больше 1 раза' : `не больше ${ref.settings.max_same_subject} раз`),
+          'Меняется в «Настройках»')),
       el('div', { class: 'scroll-x' }, el('table', { class: 'data' },
         el('thead', {}, el('tr', {}, el('th', {}), el('th', {}, 'Группа'), el('th', {}, 'Готовность'))),
         el('tbody', {}, rows.length ? rows : el('tr', {}, el('td', { colspan: 3, class: 'muted' }, 'Групп пока нет.'))))),
@@ -614,7 +615,7 @@ async function openAutoSchedule() {
       onclick: () => quiet(async () => {
         const groupIds = ref.groups.filter(g => check.find(x => x.group_id === g.id)?.ready && !v.off.has(g.id)).map(g => g.id);
         const dates = v.period === 'week' ? week : [state.date];
-        const r = await api('POST', '/auto', { dates, group_ids: groupIds, min_pairs: v.minPairs, max_pairs: v.maxPairs, max_same: v.maxSame });
+        const r = await api('POST', '/auto', { dates, group_ids: groupIds, min_pairs: v.minPairs, max_pairs: v.maxPairs });
         await reload();
         state.day = await api('GET', `/day/${state.date}`);
         close();
@@ -1601,6 +1602,7 @@ async function renderSettings(main) {
   const s = ref.settings;
   const v = {
     min_pairs: s.min_pairs, max_pairs: s.max_pairs, teacher_max_pairs: s.teacher_max_pairs, hours_per_pair: s.hours_per_pair,
+    max_same_subject: s.max_same_subject,
     study_days: s.study_days, semester1_end: s.semester1_end ?? '', semester2_end: s.semester2_end ?? '', bells: s.bells.map(b => ({ ...b })),
   };
   const nums = n => Array.from({ length: n }, (_, i) => [i + 1, String(i + 1)]);
@@ -1613,7 +1615,9 @@ async function renderSettings(main) {
           'от', select(nums(s.pairs_per_day), v.min_pairs, x => { v.min_pairs = Number(x); }),
           'до', select(nums(s.pairs_per_day), v.max_pairs, x => { v.max_pairs = Number(x); })),
         'Меньше минимума — предупреждение, больше максимума — ошибка'),
-        field('Максимум пар в день у преподавателя', select(nums(s.pairs_per_day), v.teacher_max_pairs, x => { v.teacher_max_pairs = Number(x); }))),
+        field('Максимум пар в день у преподавателя', select(nums(s.pairs_per_day), v.teacher_max_pairs, x => { v.teacher_max_pairs = Number(x); })),
+        field('Один предмет у группы в день', select([[1, 'не больше 1 раза'], [2, 'не больше 2 раз (спаренные)'], [3, 'не больше 3 раз']], v.max_same_subject, x => { v.max_same_subject = Number(x); }),
+          'Лекция и практика по одному предмету считаются одним предметом')),
       el('div', { class: 'row' },
         field('Учебных дней в неделе', select([[5, '5 (пн–пт)'], [6, '6 (пн–сб)']], v.study_days, x => { v.study_days = Number(x); })),
         field('Конец 1-го семестра', el('input', { type: 'date', value: v.semester1_end, onchange: e => { v.semester1_end = e.target.value; } })),

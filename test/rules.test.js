@@ -5,6 +5,8 @@ import { createStore } from '../js/store.js';
 import { validateDay, computeProgress } from '../js/logic.js';
 
 const demo = JSON.parse(fs.readFileSync(new URL('./fixtures/demo.json', import.meta.url), 'utf8'));
+// В демо-неделе у некоторых групп по две пары одного предмета в день — эти тесты проверяют другие правила.
+demo.settings = { ...demo.settings, max_same_subject: 2 };
 const ADMIN = { admin: true };
 const GUEST = { admin: false };
 
@@ -163,4 +165,24 @@ test('предметы без групп (остатки старых удале
   assert.equal(st.pruneUnusedSubjects(), 1);
   assert.ok(!data.subjects.some(s => s.name === 'Сирота'));
   assert.equal(st.pruneUnusedSubjects(), 0);
+});
+
+test('один предмет у группы в день — не больше одного раза (лекция и практика тоже считаются)', () => {
+  const data = structuredClone(demo);
+  data.settings = { ...data.settings, max_same_subject: 1 };
+  const st = createStore(data);
+  const call = (method, path, body = {}) => st.handle(method, path, new URLSearchParams(), body, { admin: true });
+  const bu = data.groups.find(g => g.name === 'БУ-21');
+  const math = data.curriculum.find(c => c.group_id === bu.id && data.subjects.find(s => s.id === c.subject_id).name === 'Математика');
+  const date = '2026-11-02';
+  call('PUT', `/day/${date}/cell`, { group_id: bu.id, pair: 1, lessons: [{ curriculum_id: math.id, kind: 'lecture', room_id: 1 }] });
+  call('PUT', `/day/${date}/cell`, { group_id: bu.id, pair: 2, lessons: [{ curriculum_id: math.id, kind: 'practice', room_id: 1 }] });
+  assert.ok(validateDay(data, date).some(i => i.level === 'error' && i.text.includes('«Математика» 2 раза за день')));
+
+  // автосоставление на неделю: ни одного повтора предмета в день
+  call('POST', '/auto', { dates: ['2026-11-09', '2026-11-10', '2026-11-11', '2026-11-12', '2026-11-13'], group_ids: data.groups.map(g => g.id) });
+  for (const d of ['2026-11-09', '2026-11-10', '2026-11-11', '2026-11-12', '2026-11-13']) {
+    const repeats = validateDay(data, d).filter(i => i.text.includes('раза за день'));
+    assert.deepEqual(repeats.map(i => i.text), [], d);
+  }
 });

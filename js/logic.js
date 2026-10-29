@@ -9,6 +9,7 @@ export const DEFAULT_SETTINGS = {
   min_pairs: 4, // у группы/подгруппы в день: не меньше (предупреждение) …
   max_pairs: 6, // … и не больше (ошибка)
   teacher_max_pairs: 4,
+  max_same_subject: 1, // сколько раз один предмет может стоять у группы/подгруппы в один день
   study_days: 5, // учебных дней в неделе: 5 (пн–пт) или 6 (пн–сб)
   semester1_end: null, // последний день 1-го семестра, ГГГГ-ММ-ДД
   semester2_end: null, // последний день 2-го семестра
@@ -244,6 +245,20 @@ export function validateDay(data, date) {
       for (let p = pairs[0]; p <= pairs[pairs.length - 1]; p++) if (!pairs.includes(p)) gaps.push(p);
       if (gaps.length) {
         add('error', `${st.name}: окно на ${gaps.join(', ')}-й паре — пары должны идти подряд`, st.ls, g.id);
+      }
+    }
+  }
+
+  // Один предмет у группы/подгруппы в день — не больше max_same_subject раз (лекция и практика — тоже один предмет)
+  for (const g of data.groups) {
+    const streams = g.subgroups.length ? g.subgroups.map(sg => ({ sid: sg.id, name: `${g.name} (${sg.name})` })) : [{ sid: 0, name: g.name }];
+    for (const st of streams) {
+      const ls = lessons.filter(l => l.group_id === g.id && (!l.subgroup_id || !st.sid || l.subgroup_id === st.sid));
+      for (const same of groupBy(ls, l => curriculum.get(l.curriculum_id)?.subject_id).values()) {
+        const pairs = new Set(same.map(l => l.pair)).size;
+        if (pairs > s.max_same_subject) {
+          add('error', `${st.name}: «${subjName(same[0])}» ${pairs} раза за день, можно не больше ${s.max_same_subject}`, same, g.id);
+        }
       }
     }
   }

@@ -341,6 +341,8 @@ export function createStore(data) {
     for (const d of [sem1, sem2]) if (d) checkDate(d);
     if (sem1 && sem2 && sem2 <= sem1) throw bad('Конец 2-го семестра должен быть позже конца 1-го');
     const teacherMax = Number(body.teacher_max_pairs ?? s.teacher_max_pairs);
+    const maxSame = Number(body.max_same_subject ?? s.max_same_subject);
+    if (![1, 2, 3].includes(maxSame)) throw bad('Один предмет в день — от 1 до 3 раз');
     if (!(Number.isInteger(teacherMax) && teacherMax >= 1 && teacherMax <= s.pairs_per_day)) throw bad(`Пар у преподавателя в день — от 1 до ${s.pairs_per_day}`);
     const hpp = Number(body.hours_per_pair ?? s.hours_per_pair);
     const bells = body.bells ?? s.bells;
@@ -350,7 +352,7 @@ export function createStore(data) {
         bells.some(b => !/^\d{2}:\d{2}$/.test(b.start) || !/^\d{2}:\d{2}$/.test(b.end))) {
       throw bad('Сетка звонков заполнена неверно');
     }
-    data.settings = { ...data.settings, min_pairs: minPairs, max_pairs: maxPairs, teacher_max_pairs: teacherMax, study_days: studyDays, semester1_end: sem1, semester2_end: sem2, hours_per_pair: hpp, bells: bells.map((b, i) => ({ pair: i + 1, start: b.start, end: b.end })) };
+    data.settings = { ...data.settings, min_pairs: minPairs, max_pairs: maxPairs, teacher_max_pairs: teacherMax, max_same_subject: maxSame, study_days: studyDays, semester1_end: sem1, semester2_end: sem2, hours_per_pair: hpp, bells: bells.map((b, i) => ({ pair: i + 1, start: b.start, end: b.end })) };
     return settingsOf(data);
   });
 
@@ -502,7 +504,7 @@ export function createStore(data) {
     if (notReady.length) throw bad(`Сначала укажите преподавателей у предметов групп: ${notReady.map(g => g.name).join(', ')}`);
     const r = autoSchedule(data, {
       dates, groupIds, minPairs: Number(body.min_pairs) || undefined, maxPairs: Number(body.max_pairs) || undefined,
-      maxSameSubject: Number(body.max_same) || undefined,
+      maxSameSubject: Number(body.max_same) || undefined, // по умолчанию — из настроек
     });
     for (const l of r.lessons) {
       ensureDay(l.date);
